@@ -20,7 +20,7 @@ jobs:
         run: |
           python -m compileall -q services/automation-mail-worker apps/token-pool-client/src
       - name: Install test dependencies
-        run: python -m pip install "cryptography>=46,<48"
+        run: python -m pip install "cryptography>=46,<48" "python-dotenv>=1.1,<2"
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Reject committed private runtime files
