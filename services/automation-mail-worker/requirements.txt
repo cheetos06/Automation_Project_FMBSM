@@ -1,0 +1,10 @@
+aspose-pdf>=25.6,<26
+cryptography>=46,<48
+h2>=4.2,<5
+httpx>=0.28,<1
+numpy>=2.3,<3
+openpyxl>=3.1,<4
+py7zr>=1,<2
+PyMuPDF>=1.26,<2
+python-dotenv>=1.1,<2
+websocket-client>=1.8,<2

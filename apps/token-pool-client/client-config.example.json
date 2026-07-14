@@ -1,0 +1,6 @@
+{
+  "endpoint": "http://35.180.210.11",
+  "upload_key": "injected-during-release-build",
+  "ca_certificate": "server.crt",
+  "github_repository": "cheetos06/Automation_Project_FMBSM"
+}

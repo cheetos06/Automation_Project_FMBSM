@@ -1,0 +1,28 @@
+[Unit]
+Description=FMBSM encrypted HTTP Copilot token pool API fallback
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/fmbsm-automation
+Environment=PYTHONUNBUFFERED=1
+Environment=ENV_FILE=/opt/fmbsm-automation/.env
+EnvironmentFile=-/opt/fmbsm-automation/.env
+ExecStart=/opt/fmbsm-automation/.venv/bin/python -m copilot_service.token_api --insecure-http --port 80
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/fmbsm-automation/data
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+MemoryMax=180M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

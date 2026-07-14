@@ -1,0 +1,64 @@
+name: Release Token Pool Client
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "apps/token-pool-client/**"
+      - ".github/workflows/token-client-release.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare pinned client configuration
+        shell: pwsh
+        env:
+          TOKEN_POOL_ENDPOINT: ${{ secrets.TOKEN_POOL_ENDPOINT }}
+          TOKEN_POOL_UPLOAD_KEY: ${{ secrets.TOKEN_POOL_UPLOAD_KEY }}
+          TOKEN_POOL_CA_CERT_B64: ${{ secrets.TOKEN_POOL_CA_CERT_B64 }}
+        run: |
+          if (-not $env:TOKEN_POOL_ENDPOINT -or -not $env:TOKEN_POOL_UPLOAD_KEY -or -not $env:TOKEN_POOL_CA_CERT_B64) {
+            throw "Token client release secrets are not configured."
+          }
+          $root = "apps/token-pool-client"
+          [IO.File]::WriteAllBytes("$root/server.crt", [Convert]::FromBase64String($env:TOKEN_POOL_CA_CERT_B64))
+          @{
+            endpoint = $env:TOKEN_POOL_ENDPOINT
+            upload_key = $env:TOKEN_POOL_UPLOAD_KEY
+            ca_certificate = "server.crt"
+            github_repository = "cheetos06/Automation_Project_FMBSM"
+          } | ConvertTo-Json | Set-Content "$root/client-config.json" -Encoding utf8
+      - name: Build standalone Windows app
+        shell: pwsh
+        run: |
+          $version = "1.0.${{ github.run_number }}"
+          ./apps/token-pool-client/build.ps1 -Version $version
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+      - name: Smoke-test packaged executable
+        shell: pwsh
+        run: |
+          $exe = "apps/token-pool-client/dist/TokenPoolClient/TokenPoolClient.exe"
+          if (-not (Test-Path $exe)) { throw "Packaged executable missing." }
+          & $exe --help
+          if ($LASTEXITCODE -ne 0) { throw "Packaged CLI smoke test failed." }
+      - name: Publish app-specific release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "token-client-v$env:RELEASE_VERSION"
+          gh release create $tag `
+            "apps/token-pool-client/release/TokenPoolClient-win-x64.zip" `
+            "apps/token-pool-client/release/TokenPoolClient-win-x64.zip.sha256" `
+            --title "Token Pool Client $env:RELEASE_VERSION" `
+            --notes "Path-scoped Windows Token Pool Client release. Other repository changes do not trigger this update." `
+            --target $env:GITHUB_SHA
