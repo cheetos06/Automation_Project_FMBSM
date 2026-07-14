@@ -21,6 +21,7 @@ sys.path.insert(0, str(SERVICE))
 sys.path.insert(0, str(CLIENT))
 
 from fmbsm_email_bot.fs_job import _looks_prior, prepare_ticket  # noqa: E402
+from fmbsm_email_bot.mail import _unread_subject_search_terms  # noqa: E402
 from fmbsm_email_bot.zip_utils import safe_extract_files  # noqa: E402
 from token_pool_client.bundle import create_bundle  # noqa: E402
 from token_pool_client.storage import ClientAccount  # noqa: E402
@@ -29,6 +30,21 @@ from copilot_service.transport_crypto import EnvelopeError, decrypt_envelope, lo
 
 
 class InputSafetyTests(unittest.TestCase):
+    def test_imap_query_routes_both_job_prefixes(self) -> None:
+        self.assertEqual(
+            _unread_subject_search_terms("[optimda-extract-dates]", "[fs-review]"),
+            (
+                "UNSEEN",
+                "OR",
+                "HEADER",
+                "Subject",
+                '"[optimda-extract-dates]"',
+                "HEADER",
+                "Subject",
+                '"[fs-review]"',
+            ),
+        )
+
     def test_fs_input_classification_and_canonical_names(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

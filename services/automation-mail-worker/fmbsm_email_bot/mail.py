@@ -48,14 +48,11 @@ class GmailClient:
                 if not self._select_mailbox(imap, mailbox):
                     continue
 
-                status, data = imap.uid(
-                    "SEARCH",
-                    None,
-                    "UNSEEN",
-                    "HEADER",
-                    "Subject",
-                    _quote_search_value(self.settings.subject_prefix),
+                search_terms = _unread_subject_search_terms(
+                    self.settings.subject_prefix,
+                    self.settings.fs_subject_prefix,
                 )
+                status, data = imap.uid("SEARCH", None, *search_terms)
                 self._require_ok(status, f"search unread trigger emails in {mailbox}")
 
                 uids = data[0].split() if data and data[0] else []
@@ -219,6 +216,17 @@ class GmailClient:
     def _require_ok(status: str, action: str) -> None:
         if status != "OK":
             raise RuntimeError(f"Failed to {action}: IMAP status {status}")
+
+
+def _unread_subject_search_terms(*prefixes: str) -> tuple[str, ...]:
+    unique = [value for value in dict.fromkeys(prefixes) if value]
+    if not unique:
+        raise ValueError("At least one subject prefix is required")
+    clauses = [("HEADER", "Subject", _quote_search_value(prefix)) for prefix in unique]
+    expression = clauses[0]
+    for clause in clauses[1:]:
+        expression = ("OR", *expression, *clause)
+    return ("UNSEEN", *expression)
 
 
 def _extract_raw_message(fetch_data) -> bytes:
