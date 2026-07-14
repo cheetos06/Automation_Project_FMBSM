@@ -29,6 +29,7 @@ from .transport_crypto import (
     decrypt_envelope,
     load_private_key,
 )
+from .upload_validation import MicrosoftSessionValidator, SessionProofUnavailable
 
 
 LOGGER = logging.getLogger("copilot-token-api")
@@ -67,6 +68,8 @@ class TokenApiServer(ThreadingHTTPServer):
         status_store: JobStatusStore,
         requests_per_minute: int,
         transport_private_key: Any,
+        session_validator: MicrosoftSessionValidator,
+        maximum_accounts: int,
     ) -> None:
         super().__init__(address, TokenApiHandler)
         self.registry = registry
@@ -74,6 +77,9 @@ class TokenApiServer(ThreadingHTTPServer):
         self.status_store = status_store
         self.rate_limiter = SlidingWindowRateLimiter(requests_per_minute)
         self.transport_private_key = transport_private_key
+        self.session_validator = session_validator
+        self.maximum_accounts = maximum_accounts
+        self.install_lock = threading.Lock()
         self._used_nonces: dict[str, float] = {}
         self._nonce_lock = threading.Lock()
         self.started_at = time.time()
@@ -122,7 +128,10 @@ class TokenApiHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "version": SERVER_VERSION,
                     "pool": self.server.registry.status(),
-                    "jobs": self.server.status_store.recent(limit=20),
+                    "jobs": [
+                        _public_job(job)
+                        for job in self.server.status_store.recent(limit=20)
+                    ],
                 },
             )
             return
@@ -177,11 +186,21 @@ class TokenApiHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "encryption_required"})
             return
         try:
-            installed = install_bundle(
-                payload,
-                self.server.registry,
-                remote_address=self.client_address[0],
+            with self.server.install_lock:
+                installed = install_bundle(
+                    payload,
+                    self.server.registry,
+                    remote_address=self.client_address[0],
+                    session_validator=self.server.session_validator.validate,
+                    maximum_accounts=self.server.maximum_accounts,
+                )
+        except SessionProofUnavailable as exc:
+            LOGGER.error("Microsoft session proof unavailable request_id=%s reason=%s", request_id, exc)
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"ok": False, "request_id": request_id, "error": "session_proof_unavailable"},
             )
+            return
         except BundleValidationError as exc:
             LOGGER.warning("Rejected bundle request_id=%s remote=%s reason=%s", request_id, self.client_address[0], exc)
             self._json(
@@ -311,6 +330,14 @@ def main() -> int:
     host = os.getenv("TOKEN_API_HOST", "0.0.0.0")
     port = args.port or int(os.getenv("TOKEN_API_PORT", "443"))
     registry = CopilotRegistry.from_env()
+    allowed_tenants = {
+        value.strip().lower()
+        for value in os.getenv("COPILOT_ALLOWED_TENANT_IDS", "").split(",")
+        if value.strip()
+    }
+    if not allowed_tenants:
+        raise RuntimeError("COPILOT_ALLOWED_TENANT_IDS must contain at least one tenant ID")
+    maximum_accounts = max(1, int(os.getenv("COPILOT_MAX_ACCOUNTS", "20")))
     status_dir = Path(os.getenv("JOB_STATUS_DIR") or (project / "data" / "job-status"))
     certificate = Path(os.getenv("TOKEN_API_CERT_FILE") or (project / "data" / "tls" / "server.crt"))
     private_key = Path(os.getenv("TOKEN_API_KEY_FILE") or (project / "data" / "tls" / "server.key"))
@@ -321,6 +348,8 @@ def main() -> int:
         status_store=JobStatusStore(status_dir),
         requests_per_minute=max(1, int(os.getenv("TOKEN_API_REQUESTS_PER_MINUTE", "12"))),
         transport_private_key=load_private_key(private_key),
+        session_validator=MicrosoftSessionValidator(allowed_tenants),
+        maximum_accounts=maximum_accounts,
     )
     insecure = args.insecure_http or os.getenv("TOKEN_API_INSECURE_HTTP", "").lower() in {"1", "true", "yes"}
     if not insecure:

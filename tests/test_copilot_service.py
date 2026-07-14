@@ -24,11 +24,15 @@ def fake_jwt(claims: dict[str, object]) -> str:
     return f"{encode({'alg': 'none'})}.{encode(claims)}.signature"
 
 
-def bundle_bytes(*, unsafe_name: str | None = None) -> bytes:
+def bundle_bytes(
+    *,
+    unsafe_name: str | None = None,
+    object_id: str = "22222222-2222-2222-2222-222222222222",
+) -> bytes:
     token = fake_jwt(
         {
             "tid": "11111111-1111-1111-1111-111111111111",
-            "oid": "22222222-2222-2222-2222-222222222222",
+            "oid": object_id,
             "preferred_username": "tester@example.com",
             "exp": int(time.time()) + 3600,
         }
@@ -63,6 +67,10 @@ class RegistryTests(unittest.TestCase):
             registry = CopilotRegistry(Path(temporary))
             installed = install_bundle(bundle_bytes(), registry, remote_address="127.0.0.1")
             self.assertEqual(installed.account.username, "tester@example.com")
+            public = installed.account.as_public_dict()
+            self.assertEqual(public["username"], "te***@example.com")
+            self.assertNotIn("last_error", public)
+            self.assertNotIn("session_path", public)
             allowed1 = registry.reserve_turn(
                 installed.account.account_id,
                 turn_limit=2,
@@ -95,6 +103,17 @@ class RegistryTests(unittest.TestCase):
             registry = CopilotRegistry(Path(temporary))
             with self.assertRaises(BundleValidationError):
                 install_bundle(bundle_bytes(unsafe_name="../escape.txt"), registry)
+
+    def test_bundle_account_quota_rejects_a_new_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            registry = CopilotRegistry(Path(temporary))
+            install_bundle(bundle_bytes(), registry, maximum_accounts=1)
+            with self.assertRaisesRegex(BundleValidationError, "account limit"):
+                install_bundle(
+                    bundle_bytes(object_id="33333333-3333-3333-3333-333333333333"),
+                    registry,
+                    maximum_accounts=1,
+                )
 
 
 if __name__ == "__main__":

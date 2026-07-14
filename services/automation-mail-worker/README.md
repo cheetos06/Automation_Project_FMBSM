@@ -22,6 +22,12 @@ and throttle failures across jobs and process restarts. The server refreshes acc
 tokens from an uploaded refresh token before expiry; accounts requiring MFA are
 skipped until a colleague runs the desktop token app again.
 
+Every upload must include a refresh token that Microsoft successfully exchanges for a
+new Copilot access token. The returned token must belong to the same account, have the
+expected Copilot audience/client, and use a tenant listed in
+`COPILOT_ALLOWED_TENANT_IDS`. The pool also enforces `COPILOT_MAX_ACCOUNTS`, so a
+publicly downloadable client credential is not the server's only trust boundary.
+
 ## Deploy
 
 Create `.env` from `.env.example`, preserve the existing Gmail App Password, then run

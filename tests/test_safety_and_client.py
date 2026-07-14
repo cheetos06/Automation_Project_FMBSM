@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import sys
 import tempfile
@@ -27,6 +28,54 @@ from token_pool_client.bundle import create_bundle  # noqa: E402
 from token_pool_client.storage import ClientAccount  # noqa: E402
 from token_pool_client.transport_crypto import encrypt_bundle  # noqa: E402
 from copilot_service.transport_crypto import EnvelopeError, decrypt_envelope, load_private_key  # noqa: E402
+from copilot_service.microsoft_oauth import CLIENT_ID, OAuthRefreshRejected  # noqa: E402
+from copilot_service.session_bundle import BundleValidationError  # noqa: E402
+from copilot_service.upload_validation import (  # noqa: E402
+    EXPECTED_AUDIENCE,
+    MicrosoftSessionValidator,
+)
+
+
+def _urlsafe_json(value: dict[str, object]) -> str:
+    encoded = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+
+
+def _test_token(tenant: str, object_id: str, *, marker: str) -> str:
+    claims: dict[str, object] = {
+        "tid": tenant,
+        "oid": object_id,
+        "preferred_username": "tester@example.com",
+        "iss": f"https://sts.windows.net/{tenant}/",
+        "aud": EXPECTED_AUDIENCE,
+        "appid": CLIENT_ID,
+        "nbf": 1,
+        "exp": 9999999999,
+        "marker": marker,
+    }
+    return f"{_urlsafe_json({'alg': 'RS256', 'typ': 'JWT'})}.{_urlsafe_json(claims)}.test-signature"
+
+
+def _session_files(access_token: str) -> dict[str, bytes]:
+    values: dict[str, object] = {
+        "private_websocket_raw_frames_1.json": [
+            {
+                "url": (
+                    "wss://substrate.office.com/m365copilot/chathub"
+                    f"?access_token={access_token}"
+                )
+            }
+        ],
+        "private_replay_templates_1.json": [
+            {"headers": {"Authorization": f"Bearer {access_token}"}}
+        ],
+        "private_playwright_cookies_1.json": [{"name": "session", "value": "test"}],
+        "private_edge_msal_refresh_token_1.json": {"refresh_token": "valid-refresh-token"},
+    }
+    return {
+        name: (json.dumps(value, separators=(",", ":")) + "\n").encode("utf-8")
+        for name, value in values.items()
+    }
 
 
 class InputSafetyTests(unittest.TestCase):
@@ -79,6 +128,46 @@ class InputSafetyTests(unittest.TestCase):
 
 
 class ClientBundleTests(unittest.TestCase):
+    def test_microsoft_refresh_proves_tenant_account_and_patches_session(self) -> None:
+        tenant = "11111111-1111-1111-1111-111111111111"
+        presented = _test_token(tenant, "22222222-2222-2222-2222-222222222222", marker="old")
+        refreshed = _test_token(tenant, "22222222-2222-2222-2222-222222222222", marker="new")
+        files = _session_files(presented)
+        validator = MicrosoftSessionValidator(
+            {tenant},
+            oauth_exchanger=lambda actual_tenant, refresh, timeout: {
+                "access_token": refreshed,
+                "refresh_token": "rotated-refresh-token",
+                "expires_in": 3600,
+            },
+        )
+        claims = validator.validate(files, presented)
+        self.assertEqual(claims["oid"], "22222222-2222-2222-2222-222222222222")
+        self.assertIn(refreshed.encode("ascii"), files["private_websocket_raw_frames_1.json"])
+        self.assertNotIn(presented.encode("ascii"), files["private_replay_templates_1.json"])
+        oauth_payload = json.loads(files["private_edge_msal_refresh_token_1.json"])
+        self.assertEqual(oauth_payload["refresh_token"], "rotated-refresh-token")
+
+    def test_microsoft_refresh_rejection_and_identity_swap_are_rejected(self) -> None:
+        tenant = "11111111-1111-1111-1111-111111111111"
+        presented = _test_token(tenant, "22222222-2222-2222-2222-222222222222", marker="old")
+        rejected = MicrosoftSessionValidator(
+            {tenant},
+            oauth_exchanger=lambda actual_tenant, refresh, timeout: (_ for _ in ()).throw(
+                OAuthRefreshRejected("invalid_grant")
+            ),
+        )
+        with self.assertRaises(BundleValidationError):
+            rejected.validate(_session_files(presented), presented)
+
+        other_account = _test_token(tenant, "33333333-3333-3333-3333-333333333333", marker="new")
+        swapped = MicrosoftSessionValidator(
+            {tenant},
+            oauth_exchanger=lambda actual_tenant, refresh, timeout: {"access_token": other_account},
+        )
+        with self.assertRaises(BundleValidationError):
+            swapped.validate(_session_files(presented), presented)
+
     def test_client_bundle_contains_only_runtime_material(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = Path(temporary) / "session"

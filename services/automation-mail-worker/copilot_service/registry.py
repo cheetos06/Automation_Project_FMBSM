@@ -40,14 +40,13 @@ class AccountRecord:
         current = time.time() if now is None else now
         data = {
             "account_id": self.account_id,
-            "username": self.username,
+            "username": _mask_username(self.username),
             "uploaded_at": self.uploaded_at,
             "access_expires_at": self.access_expires_at,
             "refresh_expires_at": self.refresh_expires_at,
             "enabled": self.enabled,
             "cooldown_until": self.cooldown_until,
             "cooldown_reason": self.cooldown_reason,
-            "last_error": self.last_error,
             "last_used_at": self.last_used_at,
             "total_turns": self.total_turns,
         }
@@ -56,6 +55,14 @@ class AccountRecord:
         data["cooldown_remaining_seconds"] = round(max(0.0, self.cooldown_until - current), 1)
         data["access_remaining_seconds"] = round(max(0.0, self.access_expires_at - current), 1)
         return data
+
+
+def _mask_username(value: str) -> str:
+    local, separator, domain = value.partition("@")
+    if not separator:
+        return (local[:1] + "***") if local else "unknown"
+    visible = local[:2] if len(local) > 1 else local[:1]
+    return f"{visible}***@{domain}"
 
 
 class CopilotRegistry:

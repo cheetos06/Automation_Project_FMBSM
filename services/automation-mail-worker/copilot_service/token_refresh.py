@@ -9,14 +9,9 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-import httpx
-
+from .microsoft_oauth import exchange_refresh_token
 from .registry import AccountRecord, CopilotRegistry
 from .session_bundle import BundleValidationError, account_id_from_claims, decode_jwt_claims
-
-
-CLIENT_ID = "4765445b-32c6-49b0-83e6-1d93765276ca"
-SCOPE = "https://substrate.office.com/sydney/.default openid profile offline_access"
 
 
 class TokenRefreshError(RuntimeError):
@@ -95,34 +90,8 @@ def _refresh_session_version(account: AccountRecord, *, timeout_seconds: float) 
     if not refresh_token:
         raise TokenRefreshError("The saved OAuth payload has no refresh_token")
 
-    response = httpx.post(
-        f"https://login.microsoftonline.com/{account.tenant_id}/oauth2/v2.0/token",
-        headers={
-            "accept": "application/json",
-            "content-type": "application/x-www-form-urlencoded;charset=utf-8",
-            "origin": "https://m365.cloud.microsoft",
-            "referer": "https://m365.cloud.microsoft/",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        },
-        data={
-            "client_id": CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "scope": SCOPE,
-            "client_info": "1",
-        },
-        timeout=timeout_seconds,
-    )
-    try:
-        payload = response.json()
-    except Exception as exc:
-        raise TokenRefreshError(f"OAuth returned non-JSON HTTP {response.status_code}") from exc
-    if not response.is_success:
-        description = str(payload.get("error_description") or payload.get("error") or "unknown error")
-        raise TokenRefreshError(f"OAuth HTTP {response.status_code}: {description[:500]}")
-    access_token = str(payload.get("access_token") or "")
-    if not access_token:
-        raise TokenRefreshError("OAuth refresh succeeded without an access_token")
+    payload = exchange_refresh_token(account.tenant_id, refresh_token, timeout_seconds)
+    access_token = str(payload["access_token"])
     claims = decode_jwt_claims(access_token)
     try:
         refreshed_account_id = account_id_from_claims(claims)

@@ -11,6 +11,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -90,6 +91,8 @@ def install_bundle(
     registry: CopilotRegistry,
     *,
     remote_address: str | None = None,
+    session_validator: Callable[[dict[str, bytes], str], dict[str, Any]] | None = None,
+    maximum_accounts: int | None = None,
 ) -> InstalledBundle:
     if not payload:
         raise BundleValidationError("The uploaded bundle is empty")
@@ -109,7 +112,10 @@ def install_bundle(
         raise BundleValidationError("The upload-cookie snapshot is empty")
 
     token = find_access_token(frames)
-    claims = decode_jwt_claims(token)
+    if session_validator is None:
+        claims = decode_jwt_claims(token)
+    else:
+        claims = session_validator(files, token)
     tenant_id = str(claims.get("tid") or "").strip().lower()
     object_id = str(claims.get("oid") or "").strip().lower()
     username = _username(claims)
@@ -119,6 +125,13 @@ def install_bundle(
         raise BundleValidationError("The uploaded access token is expired or missing required identity claims")
 
     account_id = account_id_from_claims(claims)
+    if (
+        maximum_accounts is not None
+        and maximum_accounts > 0
+        and registry.get_account(account_id) is None
+        and registry.status()["account_count"] >= maximum_accounts
+    ):
+        raise BundleValidationError("The shared account pool has reached its configured account limit")
     version_name = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(now))}-{digest[:12]}"
     versions_dir = registry.accounts_dir / account_id / "versions"
     session_path = versions_dir / version_name
