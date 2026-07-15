@@ -66,9 +66,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "token-client-v$env:RELEASE_VERSION"
-          gh release create $tag `
-            "apps/token-pool-client/release/TokenPoolClient-win-x64.zip" `
-            "apps/token-pool-client/release/TokenPoolClient-win-x64.zip.sha256" `
+          $root = "apps/token-pool-client/release"
+          $parts = @(Get-ChildItem $root -Filter "TokenPoolClient-win-x64.zip.part*" | Sort-Object Name)
+          if ($parts.Count -lt 2) { throw "Chunked release assets are missing." }
+          $assets = @(
+            "$root/TokenPoolClient-win-x64.zip"
+            "$root/TokenPoolClient-win-x64.zip.sha256"
+          ) + @($parts | ForEach-Object { $_.FullName })
+          gh release create $tag @assets `
             --title "Token Pool Client $env:RELEASE_VERSION" `
             --notes "Path-scoped Windows Token Pool Client release. Other repository changes do not trigger this update." `
             --target $env:GITHUB_SHA
