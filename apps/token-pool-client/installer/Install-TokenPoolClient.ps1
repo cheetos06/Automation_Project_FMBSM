@@ -133,6 +133,25 @@ function Get-ReleaseManifest($Release) {
     ) {
         throw "Release $($Release.tag_name) has an invalid client manifest."
     }
+    $EffectiveRuntimeId = if ([string]$Manifest.canonical_runtime_id) {
+        [string]$Manifest.canonical_runtime_id
+    } else { [string]$Manifest.runtime_id }
+    $EffectiveContentHash = if ([string]$Manifest.canonical_runtime_content_sha256) {
+        [string]$Manifest.canonical_runtime_content_sha256
+    } else { [string]$Manifest.runtime_content_sha256 }
+    $CompatibleRuntimeIds = @($Manifest.compatible_runtime_ids)
+    if ($CompatibleRuntimeIds.Count -eq 0) { $CompatibleRuntimeIds = @($EffectiveRuntimeId) }
+    if (
+        $EffectiveRuntimeId -notmatch '^[a-f0-9]{64}$' -or
+        $EffectiveContentHash -notmatch '^[a-f0-9]{64}$' -or
+        @($CompatibleRuntimeIds | Where-Object { [string]$_ -notmatch '^[a-f0-9]{64}$' }).Count -gt 0 -or
+        $CompatibleRuntimeIds -notcontains $EffectiveRuntimeId
+    ) {
+        throw "Release $($Release.tag_name) has invalid runtime compatibility metadata."
+    }
+    $Manifest | Add-Member -NotePropertyName effective_runtime_id -NotePropertyValue $EffectiveRuntimeId
+    $Manifest | Add-Member -NotePropertyName effective_runtime_content_sha256 -NotePropertyValue $EffectiveContentHash
+    $Manifest | Add-Member -NotePropertyName effective_compatible_runtime_ids -NotePropertyValue $CompatibleRuntimeIds
     return $Manifest
 }
 
@@ -292,6 +311,13 @@ function Get-RuntimeInternal([string]$RuntimeId) {
     return Join-Path (Join-Path $RuntimesRoot $RuntimeId) "_internal"
 }
 
+function Test-RuntimeStructure([string]$Internal) {
+    return (
+        (Get-ChildItem -LiteralPath $Internal -Filter "python*.dll" -File -ErrorAction SilentlyContinue | Select-Object -First 1) -and
+        (Test-Path -LiteralPath (Join-Path $Internal "playwright\driver\node.exe"))
+    )
+}
+
 function Test-RuntimeCache([string]$RuntimeId, [string]$ContentHash) {
     $RuntimeRoot = Join-Path $RuntimesRoot $RuntimeId
     $Internal = Join-Path $RuntimeRoot "_internal"
@@ -299,7 +325,7 @@ function Test-RuntimeCache([string]$RuntimeId, [string]$ContentHash) {
     if (-not (Test-Path -LiteralPath $Internal) -or -not (Test-Path -LiteralPath $Marker)) { return $false }
     try {
         $Metadata = Get-Content -Raw -LiteralPath $Marker | ConvertFrom-Json
-        return [string]$Metadata.runtime_id -eq $RuntimeId -and [string]$Metadata.runtime_content_sha256 -eq $ContentHash
+        return [string]$Metadata.runtime_id -eq $RuntimeId -and (Test-RuntimeStructure $Internal)
     } catch {
         return $false
     }
@@ -323,7 +349,7 @@ function Initialize-RuntimeCache(
         New-Item -ItemType Directory -Force -Path $StagingInternal | Out-Null
         Copy-Item -Recurse -Force -Path (Join-Path $SourceInternal "*") -Destination $StagingInternal
     }
-    if (-not (Get-ChildItem -LiteralPath $StagingInternal -Filter "python*.dll" -File | Select-Object -First 1)) {
+    if (-not (Test-RuntimeStructure $StagingInternal)) {
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $Staging
         throw "Runtime cache is incomplete."
     }
@@ -353,16 +379,14 @@ function Connect-Runtime([string]$AppDirectory, [string]$RuntimeInternal) {
     }
 }
 
-function Find-ReusableRuntime($Current, [string]$RuntimeId, [string]$ContentHash) {
+function Find-ReusableRuntime($Current, [string]$RuntimeId, [string]$ContentHash, $CompatibleRuntimeIds) {
     if (Test-RuntimeCache $RuntimeId $ContentHash) { return Get-RuntimeInternal $RuntimeId }
     if (-not $Current -or -not $Current.path) { return $null }
     $Source = Join-Path ([string]$Current.path) "app\_internal"
     if (-not (Test-Path -LiteralPath $Source)) { return $null }
 
-    $Matches = (
-        [string]$Current.runtime_id -eq $RuntimeId -and
-        [string]$Current.runtime_content_sha256 -eq $ContentHash
-    )
+    $CurrentRuntimeId = [string]$Current.runtime_id
+    $Matches = $CurrentRuntimeId -and @($CompatibleRuntimeIds) -contains $CurrentRuntimeId
     if (-not $Matches) {
         Write-LauncherLog "Checking installed runtime for one-time fast-update migration"
         $Matches = (Get-TreeContentHash $Source) -eq $ContentHash
@@ -449,17 +473,21 @@ function Install-Release($Release, $Current) {
         try {
             $ReusableRuntime = $null
             if ($Manifest) {
-                $ReusableRuntime = Find-ReusableRuntime $Current ([string]$Manifest.runtime_id) ([string]$Manifest.runtime_content_sha256)
+                $ReusableRuntime = Find-ReusableRuntime `
+                    $Current `
+                    ([string]$Manifest.effective_runtime_id) `
+                    ([string]$Manifest.effective_runtime_content_sha256) `
+                    @($Manifest.effective_compatible_runtime_ids)
             }
             if ($ReusableRuntime -and (Get-ReleaseAsset $Release ([string]$Manifest.app.name))) {
                 $AppZip = Join-Path $env:TEMP "TokenPoolClient-app-$Tag-$PID.zip"
-                Write-LauncherLog "Fast update selected for $Tag; reusing runtime $($Manifest.runtime_id)"
+                Write-LauncherLog "Fast update selected for $Tag; reusing runtime $($Manifest.effective_runtime_id)"
                 Receive-AppPackage $Release $Manifest $AppZip
                 Expand-ClientPackage $AppZip $Staging
                 Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $AppZip
                 Connect-Runtime (Join-Path $Staging "app") $ReusableRuntime
-                $RuntimeId = [string]$Manifest.runtime_id
-                $RuntimeContentHash = [string]$Manifest.runtime_content_sha256
+                $RuntimeId = [string]$Manifest.effective_runtime_id
+                $RuntimeContentHash = [string]$Manifest.effective_runtime_content_sha256
             } else {
                 $Zip = Join-Path $env:TEMP "TokenPoolClient-$Tag-$PID.zip"
                 Write-LauncherLog "Full install selected for $Tag"
@@ -469,8 +497,8 @@ function Install-Release($Release, $Current) {
                 $SourceInternal = Join-Path $Staging "app\_internal"
                 if (-not (Test-Path -LiteralPath $SourceInternal)) { throw "Downloaded release has no runtime." }
                 if ($Manifest) {
-                    $RuntimeId = [string]$Manifest.runtime_id
-                    $RuntimeContentHash = [string]$Manifest.runtime_content_sha256
+                    $RuntimeId = [string]$Manifest.effective_runtime_id
+                    $RuntimeContentHash = [string]$Manifest.effective_runtime_content_sha256
                 } else {
                     $RuntimeContentHash = Get-TreeContentHash $SourceInternal
                     $RuntimeId = "legacy-$RuntimeContentHash"

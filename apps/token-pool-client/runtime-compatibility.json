@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "inputs": {
+    "requirements.txt": "4eb87049d74e1c2d52ab791911514e8207a5b62d2c5126b19c0282502bd098de",
+    "requirements-build.txt": "c053f167d6bed6f625dfdccdafe0e0a1d38f462d4b1ff4dcbd8c8e59ac79f71a",
+    "token-pool-client.spec": "afae8ed9b5f13d15e8109bae4aea49240bf663d6025af8bcb7468d93b12fabc1"
+  },
+  "runtimes": {
+    "3.12.10": {
+      "generation": "win-x64-python-3.12.10-client-runtime-v1",
+      "legacy_manifest_runtime_id": "81426c2fe2bdfadc4e9a4aebcb9b641b62534d1a0343cae5afdf5095349eaaf3",
+      "legacy_manifest_content_sha256": "791b594b73d08311ebd2a03cb1d1ee5b5a916ee9121ca8b663723f418562604e",
+      "legacy_runtime_ids": [
+        "81426c2fe2bdfadc4e9a4aebcb9b641b62534d1a0343cae5afdf5095349eaaf3",
+        "a44c425207dac28ba0a0ced3688458f08da7127097715e30b84175514eef3cf1"
+      ]
+    }
+  }
+}
