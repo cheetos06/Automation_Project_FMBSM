@@ -2,7 +2,8 @@ param(
     [string]$Version = "1.0.0-dev",
     [string]$ConfigurationPath = "",
     [string]$OutputDirectory = "release",
-    [string]$ArtifactMirrorBaseUrl = "http://35.180.210.11/downloads/token-client"
+    [string]$ArtifactMirrorBaseUrl = "http://35.180.210.11/downloads/token-client",
+    [switch]$RequireRegisteredRuntime
 )
 
 $ErrorActionPreference = "Stop"
@@ -63,23 +64,67 @@ function Get-TreeContentHash([string]$Path) {
     }
 }
 
-function Get-RuntimeId {
+function Get-RuntimeId([string]$Generation) {
     $PythonDescription = (& $Python -c "import platform,sys; print('|'.join((platform.python_implementation(), platform.python_version(), platform.architecture()[0], sys.platform)))").Trim()
     $IdentityPackages = "altgraph,cffi,cryptography,greenlet,packaging,pefile,playwright,pycparser,pyee,pyinstaller,pyinstaller-hooks-contrib,pywin32-ctypes,setuptools,typing-extensions,wheel"
     $FrozenPackages = @(& $Python -c "from importlib.metadata import version; names='$IdentityPackages'.split(','); print(chr(10).join(n+'=='+version(n) for n in names))" | Sort-Object)
     $SpecHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Root "token-pool-client.spec")).Hash.ToLowerInvariant()
-    $Description = @{
-        schema = 1
-        python = $PythonDescription
-        packages = $FrozenPackages
-        spec_sha256 = $SpecHash
-    } | ConvertTo-Json -Depth 5 -Compress
+    $Description = (@(
+        "schema=2"
+        "generation=$Generation"
+        "python=$PythonDescription"
+        "spec_sha256=$SpecHash"
+    ) + @($FrozenPackages | ForEach-Object { "package=$_" })) -join "`n"
     $Hasher = [Security.Cryptography.SHA256]::Create()
     try {
         $Bytes = [Text.Encoding]::UTF8.GetBytes($Description)
         return ([BitConverter]::ToString($Hasher.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant()
     } finally {
         $Hasher.Dispose()
+    }
+}
+
+function Get-RuntimeCompatibility {
+    $Path = Join-Path $Root "runtime-compatibility.json"
+    $Compatibility = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+    if ($Compatibility.schema_version -ne 1) { throw "Unsupported runtime compatibility schema." }
+    foreach ($Input in $Compatibility.inputs.PSObject.Properties) {
+        $InputPath = Join-Path $Root $Input.Name
+        $Actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $InputPath).Hash.ToLowerInvariant()
+        if ($Actual -ne ([string]$Input.Value).ToLowerInvariant()) {
+            throw "Runtime input $($Input.Name) changed. Update runtime-compatibility.json and review which older runtimes remain compatible."
+        }
+    }
+    $PythonVersion = (& $Python -c "import platform; print(platform.python_version())").Trim()
+    $Runtime = $Compatibility.runtimes.PSObject.Properties |
+        Where-Object Name -eq $PythonVersion |
+        Select-Object -ExpandProperty Value -First 1
+    if (-not $Runtime) {
+        if ($RequireRegisteredRuntime) {
+            throw "Python $PythonVersion is not registered in runtime-compatibility.json. Review compatibility before publishing."
+        }
+        return [pscustomobject]@{
+            generation = "local-python-$PythonVersion"
+            legacy_runtime_ids = @()
+            legacy_manifest_runtime_id = ""
+            legacy_manifest_content_sha256 = ""
+        }
+    }
+    $LegacyIds = @($Runtime.legacy_runtime_ids)
+    if (@($LegacyIds | Where-Object { [string]$_ -notmatch '^[a-f0-9]{64}$' }).Count -gt 0) {
+        throw "runtime-compatibility.json contains an invalid legacy runtime ID."
+    }
+    foreach ($Name in "legacy_manifest_runtime_id", "legacy_manifest_content_sha256") {
+        $Value = [string]$Runtime.$Name
+        if ($Value -and $Value -notmatch '^[a-f0-9]{64}$') {
+            throw "runtime-compatibility.json contains an invalid $Name."
+        }
+    }
+    return [pscustomobject]@{
+        generation = [string]$Runtime.generation
+        legacy_runtime_ids = $LegacyIds
+        legacy_manifest_runtime_id = [string]$Runtime.legacy_manifest_runtime_id
+        legacy_manifest_content_sha256 = [string]$Runtime.legacy_manifest_content_sha256
     }
 }
 
@@ -133,8 +178,16 @@ $RuntimeInternal = Join-Path $Root "dist\TokenPoolClient\_internal"
 if (-not (Test-Path -LiteralPath $RuntimeInternal)) {
     throw "PyInstaller runtime directory was not created."
 }
-$RuntimeId = Get-RuntimeId
+$RuntimeCompatibility = Get-RuntimeCompatibility
+$RuntimeId = Get-RuntimeId ([string]$RuntimeCompatibility.generation)
 $RuntimeContentHash = Get-TreeContentHash $RuntimeInternal
+$CompatibleRuntimeIds = @($RuntimeId) + @($RuntimeCompatibility.legacy_runtime_ids)
+$PublishedRuntimeId = if ([string]$RuntimeCompatibility.legacy_manifest_runtime_id) {
+    [string]$RuntimeCompatibility.legacy_manifest_runtime_id
+} else { $RuntimeId }
+$PublishedRuntimeContentHash = if ([string]$RuntimeCompatibility.legacy_manifest_content_sha256) {
+    [string]$RuntimeCompatibility.legacy_manifest_content_sha256
+} else { $RuntimeContentHash }
 
 $ReleaseRoot = Join-Path $Root $OutputDirectory
 $PackageRoot = Join-Path $ReleaseRoot "TokenPoolClient-win-x64"
@@ -167,6 +220,7 @@ $Config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Package
     built_at = [DateTime]::UtcNow.ToString("o")
     runtime_id = $RuntimeId
     runtime_content_sha256 = $RuntimeContentHash
+    runtime_generation = [string]$RuntimeCompatibility.generation
 } |
     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $PackageRoot "version.json") -Encoding utf8
 
@@ -207,8 +261,11 @@ $Manifest = [ordered]@{
     schema_version = 1
     version = $Version
     tag = $Tag
-    runtime_id = $RuntimeId
-    runtime_content_sha256 = $RuntimeContentHash
+    runtime_id = $PublishedRuntimeId
+    runtime_content_sha256 = $PublishedRuntimeContentHash
+    canonical_runtime_id = $RuntimeId
+    canonical_runtime_content_sha256 = $RuntimeContentHash
+    compatible_runtime_ids = $CompatibleRuntimeIds
     mirror_base_url = "$($ArtifactMirrorBaseUrl.TrimEnd('/'))/$Tag"
     app = [ordered]@{
         name = "TokenPoolClient-app-win-x64.zip"

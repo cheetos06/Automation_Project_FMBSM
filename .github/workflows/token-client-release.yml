@@ -41,7 +41,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "1.0.${{ github.run_number }}"
-          ./apps/token-pool-client/build.ps1 -Version $version
+          ./apps/token-pool-client/build.ps1 -Version $version -RequireRegisteredRuntime
           "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
       - name: Smoke-test packaged executable
         shell: pwsh

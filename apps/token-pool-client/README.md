@@ -32,6 +32,11 @@ exact public installer completed a clean office-network installation in 2m22s ve
 the prior 10–13 minutes; an ordinary update completed in 14.52s. A no-change check
 does not download an asset.
 
+Production builds also validate `runtime-compatibility.json` against the exact Python
+version, requirements files, and PyInstaller spec. A real runtime change therefore
+fails the release build until compatibility is reviewed explicitly; source-only app
+changes keep using the cached runtime.
+
 The AWS mirror is only a speed layer: GitHub remains the version authority, and every
 mirrored package must match the SHA-256 value from the GitHub release manifest before
 activation. Progress and fallback details are written to
