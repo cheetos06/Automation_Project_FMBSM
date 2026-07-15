@@ -27,9 +27,10 @@ native ZIP extractor is used when available.
 Normal releases publish a separate app layer of about 3.31 MB. The launcher verifies
 that layer, connects it to the cached runtime with a directory junction, and retains
 the previous version for rollback. Exact dependency pins and a normalized runtime
-fingerprint prevent build timestamps from causing unnecessary full downloads. A real
-office-network benchmark reduced first installation from 10–13 minutes to 3m48s and
-reduced an ordinary update to 14.52s. A no-change check does not download an asset.
+fingerprint prevent build timestamps from causing unnecessary full downloads. The
+exact public installer completed a clean office-network installation in 2m22s versus
+the prior 10–13 minutes; an ordinary update completed in 14.52s. A no-change check
+does not download an asset.
 
 The AWS mirror is only a speed layer: GitHub remains the version authority, and every
 mirrored package must match the SHA-256 value from the GitHub release manifest before
