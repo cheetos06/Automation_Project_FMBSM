@@ -1,0 +1,29 @@
+[Unit]
+Description=FMBSM automation Gmail worker
+After=network-online.target fmbsm-token-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/fmbsm-automation
+Environment=PYTHONUNBUFFERED=1
+Environment=ENV_FILE=/opt/fmbsm-automation/.env
+Environment=DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+EnvironmentFile=-/opt/fmbsm-automation/.env
+ExecStart=/opt/fmbsm-automation/.venv/bin/python -m fmbsm_email_bot.worker
+Restart=always
+RestartSec=15
+TimeoutStopSec=45
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/fmbsm-automation/data
+MemoryHigh=800M
+MemoryMax=1400M
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

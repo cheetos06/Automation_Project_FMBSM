@@ -1,0 +1,48 @@
+# Secrets and machine-specific configuration
+**/.env
+**/.env.*
+!**/.env.example
+**/client-config.json
+**/server.crt
+**/server.key
+*.pem
+
+# Python/build artifacts
+**/__pycache__/
+**/*.py[cod]
+**/.venv/
+**/.build-venv/
+**/build/
+**/dist/
+**/release/
+**/*.egg-info/
+**/src/token_pool_client/_build_version.py
+
+# Runtime/session data
+**/data/
+**/logs/
+**/jobs/
+**/processed/
+**/failed/
+**/state/
+**/browser_profile/
+**/edge-profile/
+**/api_session/
+**/bootstrap-work/
+**/private_*
+*.sqlite3*
+
+# Generated review artifacts and source dossiers
+**/Output/
+**/copilot_runs/
+*.xlsx
+*.xlsm
+*.pdf
+*.zip
+*.7z
+
+# Editors/OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
