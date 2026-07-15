@@ -15,8 +15,8 @@ It follows both systemd services. Each FS job also has:
 /opt/fmbsm-automation/data/mail/state/job-status/<job-id>.events.jsonl
 ```
 
-The authenticated token API `GET /v1/status` exposes pool turns, expiry, errors, and
-cooldowns to the desktop app.
+The authenticated token API `GET /v1/status` exposes privacy-masked pool identities,
+turns, expiry, and cooldowns to the desktop app.
 
 ## Recovery
 
