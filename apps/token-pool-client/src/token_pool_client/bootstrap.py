@@ -24,6 +24,10 @@ DEFAULT_PROMPT = 'Reply with only this JSON: {"bootstrap": true}'
 _INTERACTION_CALLBACK: Callable[[str], None] | None = None
 
 
+class InteractiveAuthenticationRequired(RuntimeError):
+    """A fresh Microsoft authorization could not finish without user interaction."""
+
+
 def set_interaction_callback(callback: Callable[[str], None] | None) -> None:
     global _INTERACTION_CALLBACK
     _INTERACTION_CALLBACK = callback
@@ -633,7 +637,7 @@ def _current_msal_refresh_state(page: Page, minimum_updated_at_ms: int, expected
     return state if isinstance(state, dict) else {}
 
 
-def _clear_stale_msal_cache(page: Page, context: Any) -> None:
+def _clear_stale_msal_cache(page: Page, context: Any, *, clear_cookies: bool) -> None:
     page.evaluate(
         """() => {
           for (const key of Object.keys(localStorage)) {
@@ -641,10 +645,11 @@ def _clear_stale_msal_cache(page: Page, context: Any) -> None:
           }
         }"""
     )
-    # This is a dedicated per-account automation profile. Clearing its cookies
-    # guarantees a new authorization instead of leaving M365 visibly open while
-    # it continues to rely on a dead fixed-lifetime SPA refresh token.
-    context.clear_cookies()
+    if clear_cookies:
+        # Account selection is intentionally isolated to manual renewal. Scheduled
+        # work-account renewal keeps the dedicated profile's Microsoft SSO cookies
+        # so a new authorization can normally complete without a visible window.
+        context.clear_cookies()
 
 
 def _active_auth_page(context: Any, current: Page) -> Page:
@@ -693,8 +698,19 @@ def renew_microsoft_session(
     channel: str | None = "msedge",
     timeout_seconds: int = 300,
     progress: Callable[[str], None] | None = None,
+    mode: str = "select_account",
+    prompt_user: bool = True,
 ) -> dict[str, Any]:
-    """Create a new SPA sign-in session after Microsoft's fixed 24-hour RT expires."""
+    """Create a genuinely new SPA authorization, not an RT-grant rotation.
+
+    ``silent`` uses the dedicated profile's existing Microsoft SSO session in a
+    headless Edge process. ``expected_account`` opens Edge for the known account
+    if Microsoft needs MFA or another interaction. ``select_account`` is reserved
+    for user-initiated renewal where multiple accounts may exist.
+    """
+    if mode not in {"silent", "expected_account", "select_account"}:
+        raise ValueError(f"Unsupported Microsoft renewal mode: {mode}")
+    headless = mode == "silent"
     launched_ms = int(time.time() * 1000) - 5000
     started = time.monotonic()
     prompted = False
@@ -703,9 +719,9 @@ def renew_microsoft_session(
     session_dir.mkdir(parents=True, exist_ok=True)
 
     if progress is not None:
-        progress("Opening the dedicated Edge profile...")
+        progress("Opening the dedicated Edge profile invisibly..." if headless else "Opening the dedicated Edge profile...")
     with sync_playwright() as playwright:
-        context = launch_context(playwright, profile_dir, channel=channel, headless=False)
+        context = launch_context(playwright, profile_dir, channel=channel, headless=headless)
         try:
             if progress is not None:
                 progress("Edge opened; loading Microsoft 365...")
@@ -716,41 +732,59 @@ def renew_microsoft_session(
                 pass
             wait_for_page_settle(page, timeout_ms=10000)
 
-            # A SPA refresh token cannot be extended past its fixed lifetime. Remove
-            # this dedicated profile's stale browser authentication state so M365
-            # performs a new authorization and requests MFA when policy requires it.
+            # A refresh-token grant cannot extend a SPA token's fixed 24-hour
+            # lifetime. Remove the app's MSAL cache so the authorize endpoint must
+            # create a new authorization. Preserve Microsoft cookies for the
+            # scheduled work-account path; they are what makes fresh auth silent.
             if progress is not None:
-                progress("Clearing the expired 24-hour Microsoft session...")
-            _clear_stale_msal_cache(page, context)
+                progress("Starting a fresh Microsoft authorization (not a token rotation)...")
+            _clear_stale_msal_cache(page, context, clear_cookies=mode == "select_account")
             if progress is not None:
-                progress(f"Opening Microsoft's account selector for {expected_username}...")
+                if mode == "silent":
+                    progress(f"Using the saved Microsoft SSO session for {expected_username}...")
+                elif mode == "select_account":
+                    progress(f"Opening Microsoft's account selector for {expected_username}...")
+                else:
+                    progress(f"Opening Microsoft sign-in for {expected_username}...")
+            authorize_parameters = {
+                "client_id": OFFICE_HOME_CLIENT_ID,
+                "redirect_uri": "https://m365.cloud.microsoft/landingv2",
+                "response_type": "code id_token",
+                "response_mode": "form_post",
+                "scope": "openid profile https://www.office.com/v2/OfficeHome.All",
+                "nonce": uuid.uuid4().hex,
+                "state": uuid.uuid4().hex,
+                "sso_reload": "true",
+                "login_hint": expected_username,
+            }
+            if mode == "silent":
+                # Selecting the already-known tile starts a new authorization and
+                # therefore a new fixed 24-hour SPA lifetime. prompt=none can return
+                # to M365 without rebuilding its MSAL cache, which is not sufficient.
+                authorize_parameters["prompt"] = "select_account"
+            elif mode == "select_account":
+                authorize_parameters["prompt"] = "select_account"
+            else:
+                authorize_parameters["prompt"] = "login"
             authorize_url = (
                 f"https://login.microsoftonline.com/{expected_tenant or 'organizations'}/oauth2/v2.0/authorize?"
-                + urllib.parse.urlencode(
-                    {
-                        "client_id": OFFICE_HOME_CLIENT_ID,
-                        "redirect_uri": "https://m365.cloud.microsoft/landingv2",
-                        "response_type": "code id_token",
-                        "response_mode": "form_post",
-                        "scope": "openid profile https://www.office.com/v2/OfficeHome.All",
-                        "nonce": uuid.uuid4().hex,
-                        "state": uuid.uuid4().hex,
-                        "prompt": "select_account",
-                        "sso_reload": "true",
-                    }
-                )
+                + urllib.parse.urlencode(authorize_parameters)
             )
             try:
                 page.goto(authorize_url, wait_until="domcontentloaded", timeout=30000)
             except TimeoutError:
                 pass
-            if progress is not None:
-                progress(f"Select {expected_username} in Edge and complete sign-in/MFA...")
+            if progress is not None and not headless:
+                if mode == "select_account":
+                    progress(f"Select {expected_username} in Edge and complete sign-in/MFA...")
+                else:
+                    progress(f"Complete Microsoft sign-in/MFA for {expected_username} if requested...")
 
             deadline = time.monotonic() + timeout_seconds
             state: dict[str, Any] = {}
             last_auto_action = 0.0
             auto_action_count = 0
+            opened_m365_after_authorize = False
             while time.monotonic() < deadline:
                 page = _active_auth_page(context, page)
                 try:
@@ -774,6 +808,16 @@ def renew_microsoft_session(
                     return result
 
                 elapsed = time.monotonic() - started
+                current_url = str(state.get("href") or page.url).lower()
+                if not opened_m365_after_authorize and "/landingv2" in current_url:
+                    opened_m365_after_authorize = True
+                    if progress is not None:
+                        progress("Microsoft authorization returned successfully; opening M365 to create its fresh token cache...")
+                    try:
+                        page.goto(site, wait_until="domcontentloaded", timeout=30000)
+                    except TimeoutError:
+                        pass
+                    continue
                 if elapsed >= 3 and elapsed - last_auto_action >= 1.5 and auto_action_count < 8:
                     action = _automatic_reauth_step(page, expected_username)
                     if action:
@@ -781,13 +825,34 @@ def renew_microsoft_session(
                         last_auto_action = elapsed
                         if progress is not None:
                             progress(f"Microsoft sign-in step: {action}.")
+                if headless and elapsed >= 8:
+                    page_text = visible_text(page).lower()
+                    interaction_markers = (
+                        "error=interaction_required",
+                        "error=login_required",
+                        "aadsts50058",
+                        "enter password",
+                        "approve sign in request",
+                        "verify your identity",
+                        "more information required",
+                    )
+                    if any(marker in current_url or marker in page_text for marker in interaction_markers):
+                        raise InteractiveAuthenticationRequired(
+                            f"Microsoft requires visible sign-in or MFA for {expected_username}"
+                        )
+                    if elapsed >= 15 and "login.microsoftonline.com" in current_url:
+                        raise InteractiveAuthenticationRequired(
+                            f"Microsoft is still waiting for visible sign-in for {expected_username}"
+                        )
                 if progress is not None and elapsed - last_progress >= 10:
+                    location = urllib.parse.urlsplit(str(state.get("href") or page.url))
                     progress(
                         "Waiting for Microsoft sign-in "
-                        f"({int(elapsed)}s; MSAL records={state.get('recordCount', 0)})..."
+                        f"({int(elapsed)}s; page={location.netloc}{location.path}; "
+                        f"MSAL records={state.get('recordCount', 0)})..."
                     )
                     last_progress = elapsed
-                if not prompted and elapsed >= 4:
+                if not headless and prompt_user and not prompted and elapsed >= 4:
                     prompted = True
                     _pause(
                         f"Microsoft requires a new sign-in for {expected_username}.\n\n"
@@ -805,6 +870,10 @@ def renew_microsoft_session(
             except Exception:
                 pass
 
+    if headless:
+        raise InteractiveAuthenticationRequired(
+            f"Microsoft could not create a fresh session silently for {expected_username}"
+        )
     raise RuntimeError(
         f"Microsoft sign-in for {expected_username} did not produce a new session within {timeout_seconds} seconds."
     )

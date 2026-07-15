@@ -27,6 +27,12 @@ from fmbsm_email_bot.mail import _unread_subject_search_terms  # noqa: E402
 from fmbsm_email_bot.worker import _is_authorized_job_sender  # noqa: E402
 from fmbsm_email_bot.zip_utils import safe_extract_files  # noqa: E402
 from token_pool_client.bundle import create_bundle  # noqa: E402
+from token_pool_client.automation import (  # noqa: E402
+    configured_refresh_times,
+    is_automatic_work_account,
+    latest_due_slot,
+    slot_key,
+)
 from token_pool_client.refresh import (  # noqa: E402
     RefreshError,
     decrypt_captured_msal,
@@ -156,6 +162,35 @@ class InputSafetyTests(unittest.TestCase):
 
 
 class ClientBundleTests(unittest.TestCase):
+    def test_only_company_work_domains_are_automatically_renewed(self) -> None:
+        for username in ("person@forvismazars.com", "PERSON@MAZARS.FR"):
+            self.assertTrue(is_automatic_work_account(username), username)
+        for username in (
+            "anas.nmili@edu.isga.ma",
+            "person@sub.mazars.fr",
+            "person@mazars.fr.attacker.example",
+            "person@gmail.com",
+            "invalid",
+        ):
+            self.assertFalse(is_automatic_work_account(username), username)
+
+    def test_automatic_schedule_uses_local_0445_and_0945_slots(self) -> None:
+        times = configured_refresh_times("")
+        self.assertEqual(times, ("04:45", "09:45"))
+        before_second = datetime(2026, 7, 15, 9, 44).astimezone()
+        due = latest_due_slot(before_second, times)
+        self.assertIsNotNone(due)
+        self.assertEqual((due.hour, due.minute), (4, 45))
+        self.assertIn("T04:45", slot_key(due))
+        after_second = datetime(2026, 7, 15, 9, 46).astimezone()
+        due = latest_due_slot(after_second, times)
+        self.assertIsNotNone(due)
+        self.assertEqual((due.hour, due.minute), (9, 45))
+
+    def test_schedule_rejects_invalid_times(self) -> None:
+        with self.assertRaises(ValueError):
+            configured_refresh_times("25:00")
+
     def test_expired_spa_refresh_token_requires_real_sign_in(self) -> None:
         self.assertTrue(
             requires_interactive_reauthentication(
