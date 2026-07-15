@@ -8,6 +8,7 @@ import unittest
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -23,6 +24,7 @@ sys.path.insert(0, str(CLIENT))
 
 from fmbsm_email_bot.fs_job import _looks_prior, prepare_ticket  # noqa: E402
 from fmbsm_email_bot.mail import _unread_subject_search_terms  # noqa: E402
+from fmbsm_email_bot.worker import _is_authorized_job_sender  # noqa: E402
 from fmbsm_email_bot.zip_utils import safe_extract_files  # noqa: E402
 from token_pool_client.bundle import create_bundle  # noqa: E402
 from token_pool_client.storage import ClientAccount  # noqa: E402
@@ -79,6 +81,27 @@ def _session_files(access_token: str) -> dict[str, bytes]:
 
 
 class InputSafetyTests(unittest.TestCase):
+    def test_job_sender_allowlist_uses_exact_addresses_and_domains(self) -> None:
+        settings = SimpleNamespace(
+            authorized_job_senders=("approved.one@gmail.com", "approved.two@gmail.com"),
+            authorized_job_sender_domains=("forvismazars.com", "mazars.fr"),
+        )
+        for sender in (
+            "person@forvismazars.com",
+            "PERSON@MAZARS.FR",
+            "approved.one@gmail.com",
+            "approved.two@gmail.com",
+        ):
+            self.assertTrue(_is_authorized_job_sender(settings, sender), sender)
+        for sender in (
+            "outsider@gmail.com",
+            "person@sub.mazars.fr",
+            "person@mazars.fr.attacker.example",
+            "person@forvismazars.com.attacker.example",
+            "",
+        ):
+            self.assertFalse(_is_authorized_job_sender(settings, sender), sender)
+
     def test_imap_query_routes_both_job_prefixes(self) -> None:
         self.assertEqual(
             _unread_subject_search_terms("[optimda-extract-dates]", "[fs-review]"),

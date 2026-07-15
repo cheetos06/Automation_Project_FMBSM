@@ -68,6 +68,15 @@ def process_cycle(settings: Settings, mail_client: GmailClient, store: MessageSt
         if job_kind is None:
             logger.debug("Skipping UID %s with subject: %s", inbound.uid, inbound.subject)
             continue
+        if not _is_authorized_job_sender(settings, inbound.sender):
+            logger.warning(
+                "Rejected unauthorized %s request UID %s from %s",
+                job_kind,
+                inbound.uid,
+                inbound.sender or "<missing sender>",
+            )
+            mail_client.mark_seen(inbound.uid, inbound.mailbox)
+            continue
 
         if jobs_started >= settings.max_messages_per_cycle:
             logger.warning(
@@ -505,6 +514,16 @@ def _job_kind(settings: Settings, subject: str) -> str | None:
     if subject.startswith(settings.fs_subject_prefix):
         return "fs_review"
     return None
+
+
+def _is_authorized_job_sender(settings: Settings, sender: str) -> bool:
+    address = sender.strip().lower()
+    if not address or "@" not in address:
+        return False
+    if address in settings.authorized_job_senders:
+        return True
+    domain = address.rsplit("@", 1)[1]
+    return domain in settings.authorized_job_sender_domains
 
 
 def _subject_year(subject: str, default: int) -> int:

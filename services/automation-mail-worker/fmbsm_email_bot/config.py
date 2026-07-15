@@ -50,6 +50,8 @@ class Settings:
     subject_prefix: str
     fs_subject_prefix: str
     fs_default_year: int
+    authorized_job_senders: tuple[str, ...]
+    authorized_job_sender_domains: tuple[str, ...]
     poll_interval_seconds: int
     log_level: str
     project_dir: Path
@@ -82,6 +84,18 @@ def load_settings() -> Settings:
     load_dotenv(dotenv_path=Path(env_file) if env_file else project_dir / ".env", encoding="utf-8-sig")
 
     data_dir = Path(os.getenv("BOT_DATA_DIR", str(project_dir))).expanduser()
+    authorized_job_senders = tuple(
+        value.lower() for value in _get_csv_env("AUTHORIZED_JOB_SENDERS", ())
+    )
+    authorized_job_sender_domains = tuple(
+        value.lower().lstrip("@")
+        for value in _get_csv_env("AUTHORIZED_JOB_SENDER_DOMAINS", ())
+    )
+    if not authorized_job_senders and not authorized_job_sender_domains:
+        raise RuntimeError(
+            "Configure AUTHORIZED_JOB_SENDERS or AUTHORIZED_JOB_SENDER_DOMAINS; "
+            "the mail worker fails closed without a sender allowlist"
+        )
 
     return Settings(
         gmail_address=_get_required_env("GMAIL_ADDRESS"),
@@ -97,6 +111,8 @@ def load_settings() -> Settings:
         subject_prefix=os.getenv("SUBJECT_PREFIX", "[optimda-extract-dates]"),
         fs_subject_prefix=os.getenv("FS_SUBJECT_PREFIX", "[fs-review]"),
         fs_default_year=_get_int_env("FS_DEFAULT_YEAR", 2025),
+        authorized_job_senders=authorized_job_senders,
+        authorized_job_sender_domains=authorized_job_sender_domains,
         poll_interval_seconds=_get_int_env("POLL_INTERVAL_SECONDS", 2),
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
         project_dir=project_dir,
