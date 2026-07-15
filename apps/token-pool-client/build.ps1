@@ -194,6 +194,8 @@ $PackageRoot = Join-Path $ReleaseRoot "TokenPoolClient-win-x64"
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $PackageRoot
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "app") | Out-Null
 Copy-Item -Recurse -Force (Join-Path $Root "dist\TokenPoolClient\*") (Join-Path $PackageRoot "app")
+Copy-Item -LiteralPath (Join-Path $Root "assets\token-pool-logo.png") -Destination (Join-Path $PackageRoot "app\token-pool-logo.png")
+Copy-Item -LiteralPath (Join-Path $Root "assets\token-pool-logo.ico") -Destination (Join-Path $PackageRoot "app\token-pool-logo.ico")
 Copy-Item -LiteralPath (Join-Path $Root "installer\Install-TokenPoolClient.ps1") `
     -Destination (Join-Path $PackageRoot "Launch-TokenPoolClient.ps1")
 
@@ -246,6 +248,8 @@ $AppLayerRoot = Join-Path $ReleaseRoot "TokenPoolClient-app-win-x64"
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $AppLayerRoot
 New-Item -ItemType Directory -Force -Path (Join-Path $AppLayerRoot "app") | Out-Null
 Copy-Item -LiteralPath (Join-Path $PackageRoot "app\TokenPoolClient.exe") -Destination (Join-Path $AppLayerRoot "app\TokenPoolClient.exe")
+Copy-Item -LiteralPath (Join-Path $PackageRoot "app\token-pool-logo.png") -Destination (Join-Path $AppLayerRoot "app\token-pool-logo.png")
+Copy-Item -LiteralPath (Join-Path $PackageRoot "app\token-pool-logo.ico") -Destination (Join-Path $AppLayerRoot "app\token-pool-logo.ico")
 foreach ($Name in "Launch-TokenPoolClient.ps1", "client-config.json", "server.crt", "version.json") {
     Copy-Item -LiteralPath (Join-Path $PackageRoot $Name) -Destination (Join-Path $AppLayerRoot $Name)
 }

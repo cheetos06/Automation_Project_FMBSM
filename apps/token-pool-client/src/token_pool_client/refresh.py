@@ -69,12 +69,13 @@ def account_id(claims: dict[str, Any]) -> str:
 def refresh_existing(account: ClientAccount) -> tuple[ClientAccount, dict[str, Any]]:
     token_file = _latest(account.session_path, "private_edge_msal_refresh_token_", ".json")
     if token_file is None:
-        return initialize_refresh(account.session_path, account.profile_path)
+        return initialize_refresh(account.session_path, account.profile_path, expected_account=account)
     payload = json.loads(token_file.read_text(encoding="utf-8-sig"))
     refresh_token = str(payload.get("refresh_token") or "")
     if not refresh_token:
-        return initialize_refresh(account.session_path, account.profile_path)
+        return initialize_refresh(account.session_path, account.profile_path, expected_account=account)
     refreshed = oauth_refresh(refresh_token, account.tenant_id)
+    _validate_expected_identity(refreshed, account)
     combined = dict(payload)
     combined.update(refreshed)
     if not refreshed.get("refresh_token"):
@@ -84,7 +85,11 @@ def refresh_existing(account: ClientAccount) -> tuple[ClientAccount, dict[str, A
     return updated, combined
 
 
-def initialize_refresh(session_dir: Path, profile_dir: Path) -> tuple[ClientAccount, dict[str, Any]]:
+def initialize_refresh(
+    session_dir: Path,
+    profile_dir: Path,
+    expected_account: ClientAccount | None = None,
+) -> tuple[ClientAccount, dict[str, Any]]:
     records = decrypt_captured_msal(session_dir)
     accounts = _account_index(records)
     candidates = [
@@ -103,8 +108,28 @@ def initialize_refresh(session_dir: Path, profile_dir: Path) -> tuple[ClientAcco
     refreshed = oauth_refresh(original_refresh_token, tenant)
     if not refreshed.get("refresh_token"):
         refreshed["refresh_token"] = original_refresh_token
+    if expected_account is not None:
+        _validate_expected_identity(refreshed, expected_account)
     account = _save_and_patch(session_dir, profile_dir, refreshed)
     return account, refreshed
+
+
+def requires_interactive_reauthentication(error: BaseException) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "aadsts700084",
+            "aadsts700082",
+            "interaction_required",
+            "login_required",
+            "invalid_grant",
+            "refresh token was issued to a single page app",
+            "refresh token has expired",
+            "no microsoft refresh token was found",
+            "captured msal state is incomplete",
+        )
+    )
 
 
 def oauth_refresh(refresh_token: str, tenant: str) -> dict[str, Any]:
@@ -145,10 +170,41 @@ def oauth_refresh(refresh_token: str, tenant: str) -> dict[str, Any]:
     return payload
 
 
+def _validate_expected_identity(payload: dict[str, Any], expected: ClientAccount) -> None:
+    claims = decode_claims(str(payload.get("access_token") or ""))
+    actual_tenant = str(claims.get("tid") or "").lower()
+    actual_object = str(claims.get("oid") or "").lower()
+    if actual_tenant != expected.tenant_id.lower() or actual_object != expected.object_id.lower():
+        raise RefreshError(
+            "Microsoft signed in a different account. "
+            f"Expected {expected.username}; close the browser and retry with that account."
+        )
+
+
 def decrypt_captured_msal(session_dir: Path) -> list[dict[str, Any]]:
     cookie_path = session_dir / "private_msal_cache_encryption.txt"
     storage_path = session_dir / "private_msal_local_storage_current.json"
-    if not cookie_path.exists() or not storage_path.exists():
+    if not storage_path.exists():
+        raise RefreshError("The captured MSAL state is incomplete; sign in again")
+    storage = json.loads(storage_path.read_text(encoding="utf-8-sig"))
+    plaintext_records: list[dict[str, Any]] = []
+    for item in storage.get("records", []):
+        key = str(item.get("key") or "")
+        if "msal" not in key.lower():
+            continue
+        try:
+            value = json.loads(item.get("value") or "{}")
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        plaintext_records.append({"key": key, "value": value, "lastUpdatedAt": value.get("lastUpdatedAt")})
+    if any(
+        "refreshtoken" in record["key"].lower() and record["value"].get("secret")
+        for record in plaintext_records
+    ):
+        return plaintext_records
+    if not cookie_path.exists():
         raise RefreshError("The captured MSAL state is incomplete; sign in again")
     raw_cookie = cookie_path.read_text(encoding="utf-8-sig").strip()
     value = raw_cookie.split("=", 1)[1] if raw_cookie.startswith("msal.cache.encryption=") else raw_cookie
@@ -162,7 +218,6 @@ def decrypt_captured_msal(session_dir: Path) -> list[dict[str, Any]]:
     base_key = _b64url(str(cookie.get("key") or ""))
     if not cookie_id or not base_key:
         raise RefreshError("The MSAL encryption cookie is malformed")
-    storage = json.loads(storage_path.read_text(encoding="utf-8-sig"))
     records: list[dict[str, Any]] = []
     for item in storage.get("records", []):
         key = str(item.get("key") or "")
@@ -171,6 +226,8 @@ def decrypt_captured_msal(session_dir: Path) -> list[dict[str, Any]]:
         try:
             wrapped = json.loads(item.get("value") or "{}")
         except json.JSONDecodeError:
+            continue
+        if not isinstance(wrapped, dict):
             continue
         if wrapped.get("id") != cookie_id or not wrapped.get("nonce") or not wrapped.get("data"):
             continue

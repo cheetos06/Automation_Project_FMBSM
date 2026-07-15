@@ -12,6 +12,7 @@ $CurrentFile = Join-Path $InstallRoot "current.json"
 $LogFile = Join-Path $InstallRoot "launcher.log"
 $AllowedMirrorHost = "35.180.210.11"
 $ParallelDownloads = 8
+$DirectInstallerRun = [string]::IsNullOrWhiteSpace([string]$MyInvocation.MyCommand.Path)
 New-Item -ItemType Directory -Force -Path $VersionsRoot, $RuntimesRoot | Out-Null
 
 function Write-LauncherLog([string]$Message) {
@@ -524,6 +525,10 @@ function Install-Release($Release, $Current) {
     Copy-Item -Force -LiteralPath (Join-Path $Destination "Launch-TokenPoolClient.ps1") -Destination (Join-Path $InstallRoot "Launch-TokenPoolClient.ps1")
     Copy-Item -Force -LiteralPath (Join-Path $Destination "client-config.json") -Destination (Join-Path $InstallRoot "client-config.json")
     Copy-Item -Force -LiteralPath (Join-Path $Destination "server.crt") -Destination (Join-Path $InstallRoot "server.crt")
+    $Logo = Join-Path $Destination "app\token-pool-logo.ico"
+    if (Test-Path -LiteralPath $Logo) {
+        Copy-Item -Force -LiteralPath $Logo -Destination (Join-Path $InstallRoot "token-pool-logo.ico")
+    }
     $Config = Get-Content -Raw -LiteralPath (Join-Path $InstallRoot "client-config.json") | ConvertFrom-Json
     $Config.ca_certificate = "server.crt"
     $Config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $InstallRoot "client-config.json") -Encoding utf8
@@ -551,7 +556,8 @@ function Install-Shortcut {
     $Shortcut.TargetPath = "powershell.exe"
     $Shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Launcher`""
     $Shortcut.WorkingDirectory = $InstallRoot
-    $Shortcut.IconLocation = "shell32.dll,14"
+    $Icon = Join-Path $InstallRoot "token-pool-logo.ico"
+    $Shortcut.IconLocation = if (Test-Path -LiteralPath $Icon) { $Icon } else { "shell32.dll,14" }
     $Shortcut.Save()
 }
 
@@ -560,19 +566,35 @@ try {
     $Current = if (Test-Path $CurrentFile) { Get-Content -Raw $CurrentFile | ConvertFrom-Json } else { $null }
     $CurrentExecutable = if ($Current -and $Current.path) { Join-Path ([string]$Current.path) "app\TokenPoolClient.exe" } else { "" }
     $CurrentRuntime = if ($Current -and $Current.path) { Join-Path ([string]$Current.path) "app\_internal" } else { "" }
-    $AppPath = if (
+    $ReleaseChanged = (
         -not $Current -or
         $Current.tag -ne $Release.tag_name -or
         -not (Test-Path -LiteralPath $CurrentExecutable) -or
         -not (Test-Path -LiteralPath $CurrentRuntime)
-    ) {
+    )
+    $AppPath = if ($ReleaseChanged) {
         Install-Release $Release $Current
     } else {
         [string]$Current.path
     }
+    $VersionLogo = Join-Path $AppPath "app\token-pool-logo.ico"
+    $InstalledLogo = Join-Path $InstallRoot "token-pool-logo.ico"
+    $LogoChanged = $false
+    if (Test-Path -LiteralPath $VersionLogo) {
+        $LogoChanged = -not (Test-Path -LiteralPath $InstalledLogo) -or
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $VersionLogo).Hash -ne
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $InstalledLogo).Hash
+        if ($LogoChanged) {
+            Copy-Item -Force -LiteralPath $VersionLogo -Destination $InstalledLogo
+        }
+    }
     $ShortcutPath = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\FMBSM\Token Pool Client.lnk"
-    if ($InstallOnly -or -not (Test-Path $ShortcutPath)) {
+    if ($InstallOnly -or $ReleaseChanged -or $LogoChanged -or -not (Test-Path $ShortcutPath)) {
         Install-Shortcut
+    }
+    if ($DirectInstallerRun) {
+        Write-LauncherLog "Installed under $InstallRoot"
+        Write-LauncherLog "Start Menu shortcut: $ShortcutPath"
     }
     if (-not $InstallOnly) {
         Start-Process -FilePath (Join-Path $AppPath "app\TokenPoolClient.exe") -WorkingDirectory (Join-Path $AppPath "app")

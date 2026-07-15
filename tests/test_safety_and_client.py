@@ -27,6 +27,11 @@ from fmbsm_email_bot.mail import _unread_subject_search_terms  # noqa: E402
 from fmbsm_email_bot.worker import _is_authorized_job_sender  # noqa: E402
 from fmbsm_email_bot.zip_utils import safe_extract_files  # noqa: E402
 from token_pool_client.bundle import create_bundle  # noqa: E402
+from token_pool_client.refresh import (  # noqa: E402
+    RefreshError,
+    decrypt_captured_msal,
+    requires_interactive_reauthentication,
+)
 from token_pool_client.storage import ClientAccount  # noqa: E402
 from token_pool_client.transport_crypto import encrypt_bundle  # noqa: E402
 from copilot_service.transport_crypto import EnvelopeError, decrypt_envelope, load_private_key  # noqa: E402
@@ -151,6 +156,44 @@ class InputSafetyTests(unittest.TestCase):
 
 
 class ClientBundleTests(unittest.TestCase):
+    def test_expired_spa_refresh_token_requires_real_sign_in(self) -> None:
+        self.assertTrue(
+            requires_interactive_reauthentication(
+                RefreshError("AADSTS700084: refresh token was issued to a single page app and is expired")
+            )
+        )
+        self.assertTrue(requires_interactive_reauthentication(RefreshError("invalid_grant")))
+        self.assertFalse(
+            requires_interactive_reauthentication(RefreshError("Microsoft refresh failed: connection timed out"))
+        )
+
+    def test_current_plaintext_msal_cache_does_not_require_encryption_cookie(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = Path(temporary)
+            payload = {
+                "records": [
+                    {
+                        "key": "msal.3|home.tenant|login.windows.net|refreshtoken|client",
+                        "value": json.dumps(
+                            {
+                                "credentialType": "RefreshToken",
+                                "homeAccountId": "home.tenant",
+                                "clientId": "4765445b-32c6-49b0-83e6-1d93765276ca",
+                                "secret": "test-refresh-token",
+                                "lastUpdatedAt": 123,
+                            }
+                        ),
+                    },
+                    {"key": "msal.3.account.keys", "value": "[]"},
+                ]
+            }
+            (session / "private_msal_local_storage_current.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            records = decrypt_captured_msal(session)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["value"]["secret"], "test-refresh-token")
+
     def test_microsoft_refresh_proves_tenant_account_and_patches_session(self) -> None:
         tenant = "11111111-1111-1111-1111-111111111111"
         presented = _test_token(tenant, "22222222-2222-2222-2222-222222222222", marker="old")

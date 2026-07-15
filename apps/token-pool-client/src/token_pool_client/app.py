@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -15,7 +16,12 @@ from typing import Callable
 from . import __version__
 from . import bootstrap
 from .bundle import create_bundle
-from .refresh import initialize_refresh, refresh_existing
+from .refresh import (
+    RefreshError,
+    initialize_refresh,
+    refresh_existing,
+    requires_interactive_reauthentication,
+)
 from .storage import AccountStore, ClientAccount
 from .upload import ClientConfig, load_config, server_status, upload_bundle
 
@@ -35,6 +41,9 @@ class TokenPoolApp:
         self.root.geometry("920x620")
         self.root.minsize(780, 520)
         self.root.configure(bg="#f3f6f8")
+        self.logo = self._load_logo()
+        if self.logo is not None:
+            self.root.iconphoto(True, self.logo)
         self._style()
         self._build()
         self._load_config()
@@ -55,20 +64,36 @@ class TokenPoolApp:
         style.configure("Treeview", rowheight=29, font=("Segoe UI", 10), background="white", fieldbackground="white")
         style.configure("Treeview.Heading", font=("Segoe UI Semibold", 10))
 
+    def _load_logo(self) -> tk.PhotoImage | None:
+        candidates = []
+        if getattr(sys, "frozen", False):
+            candidates.append(Path(sys.executable).resolve().parent / "token-pool-logo.png")
+        candidates.append(Path(__file__).resolve().parents[2] / "assets" / "token-pool-logo.png")
+        for path in candidates:
+            try:
+                return tk.PhotoImage(file=str(path))
+            except Exception:
+                continue
+        return None
+
     def _build(self) -> None:
         header = tk.Frame(self.root, bg="#123b4a", height=94)
         header.pack(fill=X)
         header.pack_propagate(False)
-        ttk.Label(header, text="FMBSM Copilot Token Pool", style="Title.TLabel").pack(anchor="w", padx=24, pady=(17, 0))
+        if self.logo is not None:
+            tk.Label(header, image=self.logo, bg="#123b4a", borderwidth=0).pack(side=LEFT, padx=(22, 12), pady=14)
+        heading = tk.Frame(header, bg="#123b4a")
+        heading.pack(side=LEFT, fill=BOTH, expand=True)
+        ttk.Label(heading, text="FMBSM Copilot Token Pool", style="Title.TLabel").pack(anchor="w", pady=(17, 0))
         ttk.Label(
-            header,
-            text="Refresh your Microsoft session and contribute it securely to the AWS automation pool.",
+            heading,
+            text="Renew your Microsoft sign-in and contribute it securely to the AWS automation pool.",
             style="Subtitle.TLabel",
-        ).pack(anchor="w", padx=25, pady=(2, 0))
+        ).pack(anchor="w", pady=(2, 0))
 
         controls = ttk.Frame(self.root)
         controls.pack(fill=X, padx=22, pady=(18, 10))
-        self.refresh_button = ttk.Button(controls, text="Refresh & upload all", style="Primary.TButton", command=self.refresh_all)
+        self.refresh_button = ttk.Button(controls, text="Renew sign-in & upload all", style="Primary.TButton", command=self.refresh_all)
         self.refresh_button.pack(side=LEFT)
         self.add_button = ttk.Button(controls, text="Add Microsoft account", command=self.add_account)
         self.add_button.pack(side=LEFT, padx=8)
@@ -160,6 +185,39 @@ class TokenPoolApp:
 
         threading.Thread(target=runner, name="token-pool-work", daemon=True).start()
 
+    def _browser_interaction(self, message: str) -> None:
+        event = threading.Event()
+
+        def show() -> None:
+            messagebox.showinfo("Microsoft sign-in required", message)
+            event.set()
+
+        self.root.after(0, show)
+        event.wait()
+
+    def _interactive_renewal(self, account: ClientAccount) -> ClientAccount:
+        bootstrap.set_interaction_callback(self._browser_interaction)
+        try:
+            bootstrap.renew_microsoft_session(
+                site="https://m365.cloud.microsoft/chat",
+                profile_dir=account.profile_path,
+                session_dir=account.session_path,
+                expected_username=account.username,
+                expected_tenant=account.tenant_id,
+                channel="msedge",
+                timeout_seconds=300,
+                progress=self.log,
+            )
+            renewed, _ = initialize_refresh(
+                account.session_path,
+                account.profile_path,
+                expected_account=account,
+            )
+            renewed.last_uploaded_at = account.last_uploaded_at
+            return renewed
+        finally:
+            bootstrap.set_interaction_callback(None)
+
     def refresh_all(self) -> None:
         if not self.config:
             return
@@ -170,9 +228,20 @@ class TokenPoolApp:
                 self.log("No account is configured. Choose Add Microsoft account first.")
                 return
             for account in accounts:
-                self.log(f"Refreshing {account.username}...")
+                self.log(f"Renewing Microsoft session for {account.username}...")
                 try:
-                    refreshed, _ = refresh_existing(account)
+                    try:
+                        refreshed, _ = refresh_existing(account)
+                        self.log(f"Silent Microsoft token renewal succeeded for {account.username}.")
+                    except RefreshError as exc:
+                        if not requires_interactive_reauthentication(exc):
+                            raise
+                        self.log(
+                            f"The 24-hour Microsoft sign-in expired for {account.username}; "
+                            "opening Edge for a real sign-in/MFA..."
+                        )
+                        refreshed = self._interactive_renewal(account)
+                        self.log(f"New Microsoft sign-in captured for {refreshed.username}.")
                     response = upload_bundle(self.config, create_bundle(refreshed))
                     refreshed.last_uploaded_at = time.time()
                     refreshed.last_error = None
@@ -199,17 +268,7 @@ class TokenPoolApp:
             sample = onboarding / "bootstrap.png"
             sample.write_bytes(SAMPLE_PNG)
 
-            def interact(message: str) -> None:
-                event = threading.Event()
-
-                def show() -> None:
-                    messagebox.showinfo("Complete the browser step", message)
-                    event.set()
-
-                self.root.after(0, show)
-                event.wait()
-
-            bootstrap.set_interaction_callback(interact)
+            bootstrap.set_interaction_callback(self._browser_interaction)
             try:
                 self.log("Opening a dedicated Edge window for Microsoft sign-in and Copilot bootstrap...")
                 bootstrap.bootstrap_api_session(
