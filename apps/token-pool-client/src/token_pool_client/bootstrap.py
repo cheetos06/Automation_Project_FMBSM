@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -15,6 +16,7 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Locator, Page, TimeoutError, sync_playwright
 
 PACKAGE_DIR = Path(__file__).resolve().parent
+OFFICE_HOME_CLIENT_ID = "4765445b-32c6-49b0-83e6-1d93765276ca"
 DEFAULT_PROFILE_DIR = PACKAGE_DIR / "browser_profile"
 DEFAULT_SESSION_DIR = PACKAGE_DIR / "api_session"
 DEFAULT_OUTPUT_DIR = PACKAGE_DIR / "outputs"
@@ -90,9 +92,23 @@ def launch_context(playwright: Any, profile_dir: Path, *, channel: str | None, h
         kwargs["channel"] = selected_channel
     try:
         return playwright.chromium.launch_persistent_context(str(profile_dir), **kwargs)
-    except PlaywrightError:
+    except PlaywrightError as exc:
         if "channel" not in kwargs:
             raise
+        message = str(exc).lower()
+        missing_edge = any(
+            marker in message
+            for marker in (
+                "distribution 'msedge' is not found",
+                'distribution "msedge" is not found',
+                "msedge executable doesn't exist",
+            )
+        )
+        if not missing_edge:
+            raise RuntimeError(
+                "The dedicated Microsoft Edge profile is already open or locked. "
+                "Close the previous Token Pool Client Edge window and retry."
+            ) from exc
         kwargs.pop("channel", None)
         return playwright.chromium.launch_persistent_context(str(profile_dir), **kwargs)
 
@@ -487,13 +503,19 @@ def save_msal_state(page: Page, cookies: list[dict[str, Any]], session_dir: Path
     records = state.get("records", []) if isinstance(state, dict) else []
     wrapper_ids: set[str] = set()
     refresh_ids: set[str] = set()
+    has_plaintext_refresh = False
     for item in records:
         try:
             key = str(item.get("key") or "")
             wrapper = json.loads(item.get("value") or "{}")
-            wrapper_id = str(wrapper.get("id") or "")
         except Exception:
             continue
+        if not isinstance(wrapper, dict):
+            continue
+        credential = str(wrapper.get("credentialType") or wrapper.get("credential_type") or "").lower()
+        if wrapper.get("secret") and ("refreshtoken" in key.lower() or credential == "refreshtoken"):
+            has_plaintext_refresh = True
+        wrapper_id = str(wrapper.get("id") or "")
         if wrapper_id:
             wrapper_ids.add(wrapper_id)
             if "refreshtoken" in key.lower():
@@ -517,14 +539,16 @@ def save_msal_state(page: Page, cookies: list[dict[str, Any]], session_dir: Path
 
     selected = next((item for item in encryption_cookies if cookie_id(item) in refresh_ids), None)
     selected = selected or next((item for item in encryption_cookies if cookie_id(item) in wrapper_ids), None)
-    selected = selected or (encryption_cookies[0] if encryption_cookies else None)
-    if selected is None:
+    if selected is None and not has_plaintext_refresh:
+        selected = encryption_cookies[0] if encryption_cookies else None
+    if selected is None and not has_plaintext_refresh:
         raise RuntimeError("The signed-in browser did not expose the MSAL encryption cookie")
     session_dir.mkdir(parents=True, exist_ok=True)
-    (session_dir / "private_msal_cache_encryption.txt").write_text(
-        f"msal.cache.encryption={selected['value']}\n",
-        encoding="utf-8",
-    )
+    cookie_path = session_dir / "private_msal_cache_encryption.txt"
+    if selected is not None:
+        cookie_path.write_text(f"msal.cache.encryption={selected['value']}\n", encoding="utf-8")
+    elif cookie_path.exists():
+        cookie_path.unlink()
     _write_json(
         session_dir / "private_msal_local_storage_current.json",
         {
@@ -537,8 +561,253 @@ def save_msal_state(page: Page, cookies: list[dict[str, Any]], session_dir: Path
     return {
         "record_count": len(records),
         "encryption_cookie_count": len(encryption_cookies),
-        "matched_refresh_cookie": cookie_id(selected) in refresh_ids,
+        "matched_refresh_cookie": selected is not None and cookie_id(selected) in refresh_ids,
+        "plaintext_refresh_token": has_plaintext_refresh,
     }
+
+
+def _cookies_with_partitioned_msal(context: Any, page: Page) -> list[dict[str, Any]]:
+    cookies = list(context.cookies())
+    if any(item.get("name") == "msal.cache.encryption" for item in cookies):
+        return cookies
+    try:
+        session = context.new_cdp_session(page)
+        network_cookies = session.send("Network.getAllCookies").get("cookies", [])
+    except Exception:
+        return cookies
+    existing = {
+        (str(item.get("name") or ""), str(item.get("domain") or ""), str(item.get("path") or "/"))
+        for item in cookies
+    }
+    for item in network_cookies:
+        if item.get("name") != "msal.cache.encryption":
+            continue
+        key = (str(item.get("name") or ""), str(item.get("domain") or ""), str(item.get("path") or "/"))
+        if key in existing:
+            continue
+        cookies.append(
+            {
+                "name": str(item.get("name") or ""),
+                "value": str(item.get("value") or ""),
+                "domain": str(item.get("domain") or ""),
+                "path": str(item.get("path") or "/"),
+                "expires": float(item.get("expires") or -1),
+                "httpOnly": bool(item.get("httpOnly")),
+                "secure": bool(item.get("secure")),
+                "sameSite": str(item.get("sameSite") or "Lax"),
+            }
+        )
+        existing.add(key)
+    return cookies
+
+
+def _current_msal_refresh_state(page: Page, minimum_updated_at_ms: int, expected_tenant: str) -> dict[str, Any]:
+    state = page.evaluate(
+        """({minimumUpdatedAt, expectedTenant}) => {
+          const records = Object.keys(localStorage)
+            .filter(key => key.toLowerCase().includes('msal'))
+            .map(key => ({key, value: localStorage.getItem(key)}));
+          let newestRefreshUpdatedAt = 0;
+          let refreshRecordCount = 0;
+          for (const item of records) {
+            if (!item.key.toLowerCase().includes('refreshtoken')) continue;
+            try {
+              const wrapped = JSON.parse(item.value || '{}');
+              newestRefreshUpdatedAt = Math.max(newestRefreshUpdatedAt, Number(wrapped.lastUpdatedAt || 0));
+              refreshRecordCount += 1;
+            } catch (_) {}
+          }
+          const tenant = String(expectedTenant || '').toLowerCase();
+          const tenantMatch = !tenant || records.some(item => item.key.toLowerCase().includes(tenant));
+          return {
+            href: location.href,
+            recordCount: records.length,
+            refreshRecordCount,
+            newestRefreshUpdatedAt,
+            tenantMatch,
+            fresh: tenantMatch && newestRefreshUpdatedAt >= Number(minimumUpdatedAt || 0)
+          };
+        }""",
+        {"minimumUpdatedAt": minimum_updated_at_ms, "expectedTenant": expected_tenant},
+    )
+    return state if isinstance(state, dict) else {}
+
+
+def _clear_stale_msal_cache(page: Page, context: Any) -> None:
+    page.evaluate(
+        """() => {
+          for (const key of Object.keys(localStorage)) {
+            if (key.toLowerCase().includes('msal')) localStorage.removeItem(key);
+          }
+        }"""
+    )
+    # This is a dedicated per-account automation profile. Clearing its cookies
+    # guarantees a new authorization instead of leaving M365 visibly open while
+    # it continues to rely on a dead fixed-lifetime SPA refresh token.
+    context.clear_cookies()
+
+
+def _active_auth_page(context: Any, current: Page) -> Page:
+    pages = [item for item in context.pages if not item.is_closed()]
+    for candidate in reversed(pages):
+        url = candidate.url.lower()
+        if "login.microsoftonline.com" in url or "m365.cloud.microsoft" in url:
+            return candidate
+    return pages[-1] if pages else current
+
+
+def _automatic_reauth_step(page: Page, expected_username: str) -> str | None:
+    url = page.url.lower()
+    candidates: list[tuple[str, Locator]] = []
+    if "login.microsoftonline.com" in url and expected_username:
+        candidates.append(("expected account", page.get_by_text(expected_username, exact=False)))
+    for label, pattern in (
+        ("switch account", r"switch account|sign in with another account|changer de compte|se connecter avec un autre compte"),
+        ("continue", r"^continue$|^continuer$"),
+        ("sign in", r"^sign in$|^se connecter$"),
+    ):
+        candidates.append((label, page.get_by_text(re.compile(pattern, re.IGNORECASE))))
+    for label, locator in candidates:
+        try:
+            count = min(locator.count(), 10)
+        except Exception:
+            continue
+        for index in range(count):
+            item = locator.nth(index)
+            try:
+                if item.is_visible(timeout=250) and item.is_enabled(timeout=250):
+                    item.click(timeout=2000)
+                    return label
+            except Exception:
+                continue
+    return None
+
+
+def renew_microsoft_session(
+    *,
+    site: str,
+    profile_dir: Path,
+    session_dir: Path,
+    expected_username: str,
+    expected_tenant: str,
+    channel: str | None = "msedge",
+    timeout_seconds: int = 300,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Create a new SPA sign-in session after Microsoft's fixed 24-hour RT expires."""
+    launched_ms = int(time.time() * 1000) - 5000
+    started = time.monotonic()
+    prompted = False
+    last_progress = 0.0
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    if progress is not None:
+        progress("Opening the dedicated Edge profile...")
+    with sync_playwright() as playwright:
+        context = launch_context(playwright, profile_dir, channel=channel, headless=False)
+        try:
+            if progress is not None:
+                progress("Edge opened; loading Microsoft 365...")
+            page = context.pages[0] if context.pages else context.new_page()
+            try:
+                page.goto(site, wait_until="domcontentloaded", timeout=30000)
+            except TimeoutError:
+                pass
+            wait_for_page_settle(page, timeout_ms=10000)
+
+            # A SPA refresh token cannot be extended past its fixed lifetime. Remove
+            # this dedicated profile's stale browser authentication state so M365
+            # performs a new authorization and requests MFA when policy requires it.
+            if progress is not None:
+                progress("Clearing the expired 24-hour Microsoft session...")
+            _clear_stale_msal_cache(page, context)
+            if progress is not None:
+                progress(f"Opening Microsoft's account selector for {expected_username}...")
+            authorize_url = (
+                f"https://login.microsoftonline.com/{expected_tenant or 'organizations'}/oauth2/v2.0/authorize?"
+                + urllib.parse.urlencode(
+                    {
+                        "client_id": OFFICE_HOME_CLIENT_ID,
+                        "redirect_uri": "https://m365.cloud.microsoft/landingv2",
+                        "response_type": "code id_token",
+                        "response_mode": "form_post",
+                        "scope": "openid profile https://www.office.com/v2/OfficeHome.All",
+                        "nonce": uuid.uuid4().hex,
+                        "state": uuid.uuid4().hex,
+                        "prompt": "select_account",
+                        "sso_reload": "true",
+                    }
+                )
+            )
+            try:
+                page.goto(authorize_url, wait_until="domcontentloaded", timeout=30000)
+            except TimeoutError:
+                pass
+            if progress is not None:
+                progress(f"Select {expected_username} in Edge and complete sign-in/MFA...")
+
+            deadline = time.monotonic() + timeout_seconds
+            state: dict[str, Any] = {}
+            last_auto_action = 0.0
+            auto_action_count = 0
+            while time.monotonic() < deadline:
+                page = _active_auth_page(context, page)
+                try:
+                    state = _current_msal_refresh_state(page, launched_ms, expected_tenant)
+                except Exception:
+                    state = {"href": page.url, "fresh": False}
+                if state.get("fresh"):
+                    if progress is not None:
+                        progress("Fresh Microsoft sign-in detected; capturing the new session...")
+                    cookies = _cookies_with_partitioned_msal(context, page)
+                    summary = save_msal_state(page, cookies, session_dir)
+                    run_id = _run_id("interactive_reauth")
+                    _write_json(session_dir / f"private_playwright_cookies_{run_id}.json", cookies)
+                    result = {
+                        **summary,
+                        "elapsed_seconds": round(time.monotonic() - started, 1),
+                        "expected_username": expected_username,
+                        "refresh_updated_at": state.get("newestRefreshUpdatedAt"),
+                    }
+                    _write_json(session_dir / f"{run_id}_summary.json", result)
+                    return result
+
+                elapsed = time.monotonic() - started
+                if elapsed >= 3 and elapsed - last_auto_action >= 1.5 and auto_action_count < 8:
+                    action = _automatic_reauth_step(page, expected_username)
+                    if action:
+                        auto_action_count += 1
+                        last_auto_action = elapsed
+                        if progress is not None:
+                            progress(f"Microsoft sign-in step: {action}.")
+                if progress is not None and elapsed - last_progress >= 10:
+                    progress(
+                        "Waiting for Microsoft sign-in "
+                        f"({int(elapsed)}s; MSAL records={state.get('recordCount', 0)})..."
+                    )
+                    last_progress = elapsed
+                if not prompted and elapsed >= 4:
+                    prompted = True
+                    _pause(
+                        f"Microsoft requires a new sign-in for {expected_username}.\n\n"
+                        "Complete sign-in and MFA in the Edge window. If Copilot still looks signed in, use its "
+                        "account menu to sign out or switch account, then sign in again. When the Copilot chat "
+                        "page is visible, return here and click OK."
+                    )
+                try:
+                    page.wait_for_timeout(500)
+                except Exception:
+                    time.sleep(0.5)
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+    raise RuntimeError(
+        f"Microsoft sign-in for {expected_username} did not produce a new session within {timeout_seconds} seconds."
+    )
 
 
 def wait_for_capture_ready(page: Page, capture: BootstrapCapture, timeout_seconds: int) -> bool:
@@ -596,7 +865,7 @@ def bootstrap_api_session(
             submit_method = submit_prompt_or_pause(page, interactive=True)
             ready = wait_for_capture_ready(page, capture, timeout_seconds)
             try:
-                cookies = context.cookies()
+                cookies = _cookies_with_partitioned_msal(context, page)
             except Exception:
                 cookies = []
             msal_summary = save_msal_state(page, cookies, session_dir)

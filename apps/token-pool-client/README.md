@@ -7,9 +7,13 @@ requirement.
 On first use, **Add Microsoft account** opens an isolated Edge profile. The colleague
 completes Microsoft sign-in/MFA once, and the app captures the account's Copilot
 upload/websocket session. On later starts it silently rotates the saved OAuth refresh
-token, encrypts the renewed session to the pinned server certificate, HMAC-signs the
-request, and uploads it through the corporate proxy. It then shows the AWS pool's
-accounts, turn totals, and cooldown state. The upload key is never sent on the wire.
+token while Microsoft still permits it. Microsoft SPA refresh tokens have a fixed
+24-hour lifetime; once that lifetime expires, **Renew sign-in & upload all** opens the
+account's dedicated Edge profile for a real sign-in/MFA, captures a new session,
+verifies that the expected account was used, and then uploads it. The client encrypts
+the renewed session to the pinned server certificate and HMAC-signs the request. It
+then shows the AWS pool's accounts, turn totals, and cooldown state. The upload key is
+never sent on the wire.
 
 The launcher checks only GitHub releases whose tag begins with `token-client-v`.
 Changes to any other app/service in this monorepo do not trigger a client update.
@@ -48,6 +52,10 @@ Install without Git or administrator rights:
 ```powershell
 irm https://raw.githubusercontent.com/cheetos06/Automation_Project_FMBSM/main/apps/token-pool-client/installer/Install-TokenPoolClient.ps1 | iex
 ```
+
+The command can be run from any directory. The application remains installed under
+`%LOCALAPPDATA%\FMBSM\TokenPoolClient`, and the colleague launches it from the
+**FMBSM > Token Pool Client** Start-menu shortcut.
 
 ## Local development
 
