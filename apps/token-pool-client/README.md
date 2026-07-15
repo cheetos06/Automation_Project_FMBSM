@@ -16,6 +16,32 @@ Changes to any other app/service in this monorepo do not trigger a client update
 Downloaded ZIPs are SHA-256 verified and installed under `%LOCALAPPDATA%`; the prior
 working version remains available if an update fails.
 
+## Install and update performance
+
+The visible executable is about 3.45 MB. The first install is larger because account
+onboarding needs an embedded Python/Tk/cryptography runtime and Playwright's Node
+driver (about 52 MB compressed). That runtime is downloaded once in concurrent,
+proxy-safe parts from the AWS mirror, with GitHub as an automatic fallback. Windows'
+native ZIP extractor is used when available.
+
+Normal releases publish a separate app layer of about 3.31 MB. The launcher verifies
+that layer, connects it to the cached runtime with a directory junction, and retains
+the previous version for rollback. Exact dependency pins and a normalized runtime
+fingerprint prevent build timestamps from causing unnecessary full downloads. A real
+office-network benchmark reduced first installation from 10–13 minutes to 3m48s and
+reduced an ordinary update to 14.52s. A no-change check does not download an asset.
+
+The AWS mirror is only a speed layer: GitHub remains the version authority, and every
+mirrored package must match the SHA-256 value from the GitHub release manifest before
+activation. Progress and fallback details are written to
+`%LOCALAPPDATA%\FMBSM\TokenPoolClient\launcher.log`.
+
+Install without Git or administrator rights:
+
+```powershell
+irm https://raw.githubusercontent.com/cheetos06/Automation_Project_FMBSM/main/apps/token-pool-client/installer/Install-TokenPoolClient.ps1 | iex
+```
+
 ## Local development
 
 ```powershell

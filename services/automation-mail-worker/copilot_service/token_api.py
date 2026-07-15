@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import ssl
 import threading
 import time
@@ -34,6 +35,15 @@ from .upload_validation import MicrosoftSessionValidator, SessionProofUnavailabl
 
 LOGGER = logging.getLogger("copilot-token-api")
 SERVER_VERSION = "1.0.0"
+TOKEN_CLIENT_DOWNLOAD_PREFIX = "/downloads/token-client/"
+TOKEN_CLIENT_TAG = re.compile(r"token-client-v[0-9]+\.[0-9]+\.[0-9]+(?:[-A-Za-z0-9.]*)?\Z")
+TOKEN_CLIENT_ASSET = re.compile(
+    r"TokenPoolClient-(?:"
+    r"app-win-x64\.zip(?:\.sha256)?|"
+    r"win-x64\.zip(?:\.sha256|\.part[0-9]{3})?|"
+    r"release\.json"
+    r")\Z"
+)
 
 
 class SlidingWindowRateLimiter:
@@ -70,6 +80,8 @@ class TokenApiServer(ThreadingHTTPServer):
         transport_private_key: Any,
         session_validator: MicrosoftSessionValidator,
         maximum_accounts: int,
+        artifact_root: Path,
+        artifact_requests_per_hour: int,
     ) -> None:
         super().__init__(address, TokenApiHandler)
         self.registry = registry
@@ -79,6 +91,11 @@ class TokenApiServer(ThreadingHTTPServer):
         self.transport_private_key = transport_private_key
         self.session_validator = session_validator
         self.maximum_accounts = maximum_accounts
+        self.artifact_root = artifact_root
+        self.artifact_rate_limiter = SlidingWindowRateLimiter(
+            artifact_requests_per_hour,
+            window_seconds=3600,
+        )
         self.install_lock = threading.Lock()
         self._used_nonces: dict[str, float] = {}
         self._nonce_lock = threading.Lock()
@@ -103,6 +120,8 @@ class TokenApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path.rstrip("/") or "/"
+        if self._serve_token_client_artifact(path, head_only=False):
+            return
         if path == "/health":
             status = self.server.registry.status()
             jobs = self.server.status_store.recent(limit=5)
@@ -236,10 +255,55 @@ class TokenApiHandler(BaseHTTPRequestHandler):
         )
 
     def do_HEAD(self) -> None:  # noqa: N802
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        if self._serve_token_client_artifact(path, head_only=True):
+            return
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Length", "0")
         self.send_header("X-FMBSM-Token-API-Version", SERVER_VERSION)
         self.end_headers()
+
+    def _serve_token_client_artifact(self, path: str, *, head_only: bool) -> bool:
+        if not path.startswith(TOKEN_CLIENT_DOWNLOAD_PREFIX):
+            return False
+        relative = path[len(TOKEN_CLIENT_DOWNLOAD_PREFIX):]
+        parts = relative.split("/")
+        if (
+            len(parts) != 2
+            or not TOKEN_CLIENT_TAG.fullmatch(parts[0])
+            or not TOKEN_CLIENT_ASSET.fullmatch(parts[1])
+        ):
+            self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            return True
+        if not self.server.artifact_rate_limiter.allow(self.client_address[0]):
+            self._json(HTTPStatus.TOO_MANY_REQUESTS, {"ok": False, "error": "rate_limited"})
+            return True
+
+        root = self.server.artifact_root.resolve()
+        candidate = root.joinpath(*parts)
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root)
+        except (FileNotFoundError, OSError, ValueError):
+            self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            return True
+        if not resolved.is_file():
+            self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            return True
+
+        length = resolved.stat().st_size
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-FMBSM-Token-API-Version", SERVER_VERSION)
+        self.end_headers()
+        if not head_only:
+            with resolved.open("rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    self.wfile.write(chunk)
+        return True
 
     def _authenticated(self, body: bytes) -> bool:
         timestamp_text = self.headers.get("X-FMBSM-Timestamp", "")
@@ -338,6 +402,10 @@ def main() -> int:
     if not allowed_tenants:
         raise RuntimeError("COPILOT_ALLOWED_TENANT_IDS must contain at least one tenant ID")
     maximum_accounts = max(1, int(os.getenv("COPILOT_MAX_ACCOUNTS", "20")))
+    artifact_root = Path(
+        os.getenv("TOKEN_CLIENT_ARTIFACT_DIR")
+        or (project / "data" / "client-artifacts")
+    )
     status_dir = Path(os.getenv("JOB_STATUS_DIR") or (project / "data" / "job-status"))
     certificate = Path(os.getenv("TOKEN_API_CERT_FILE") or (project / "data" / "tls" / "server.crt"))
     private_key = Path(os.getenv("TOKEN_API_KEY_FILE") or (project / "data" / "tls" / "server.key"))
@@ -350,6 +418,11 @@ def main() -> int:
         transport_private_key=load_private_key(private_key),
         session_validator=MicrosoftSessionValidator(allowed_tenants),
         maximum_accounts=maximum_accounts,
+        artifact_root=artifact_root,
+        artifact_requests_per_hour=max(
+            20,
+            int(os.getenv("TOKEN_CLIENT_DOWNLOADS_PER_HOUR", "120")),
+        ),
     )
     insecure = args.insecure_http or os.getenv("TOKEN_API_INSECURE_HTTP", "").lower() in {"1", "true", "yes"}
     if not insecure:
