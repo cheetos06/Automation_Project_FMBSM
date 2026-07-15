@@ -17,8 +17,8 @@ server data are intentionally excluded from Git.
 
 ## Install the Token Pool Client
 
-Once the repository and first `token-client-v*` release are public, colleagues can
-run this one command in a normal (non-admin) PowerShell window:
+Colleagues can install the published client by running this one command in a normal
+(non-admin) PowerShell window:
 
 ```powershell
 irm https://raw.githubusercontent.com/cheetos06/Automation_Project_FMBSM/main/apps/token-pool-client/installer/Install-TokenPoolClient.ps1 | iex
@@ -27,6 +27,11 @@ irm https://raw.githubusercontent.com/cheetos06/Automation_Project_FMBSM/main/ap
 The installer creates a Start Menu shortcut under **FMBSM**. At every launch it checks
 only Token Pool Client releases, downloads an update only when that app changed, and
 verifies the release SHA-256 before starting it.
+
+The Windows package is also published as ordered 4 MB parts for corporate proxies
+that stall large GitHub downloads. The installer rejoins the parts and verifies the
+full package checksum before activation; the first install can therefore take about
+10–15 minutes on a heavily throttled connection.
 
 ## Safe Git workflow
 
