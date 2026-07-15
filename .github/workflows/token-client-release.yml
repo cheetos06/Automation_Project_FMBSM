@@ -72,8 +72,48 @@ jobs:
           $assets = @(
             "$root/TokenPoolClient-win-x64.zip"
             "$root/TokenPoolClient-win-x64.zip.sha256"
+            "$root/TokenPoolClient-app-win-x64.zip"
+            "$root/TokenPoolClient-app-win-x64.zip.sha256"
+            "$root/TokenPoolClient-release.json"
           ) + @($parts | ForEach-Object { $_.FullName })
           gh release create $tag @assets `
             --title "Token Pool Client $env:RELEASE_VERSION" `
             --notes "Path-scoped Windows Token Pool Client release. Other repository changes do not trigger this update." `
             --target $env:GITHUB_SHA
+      - name: Mirror proxy-safe assets to AWS
+        shell: bash
+        env:
+          TOKEN_ARTIFACT_SFTP_KEY: ${{ secrets.TOKEN_ARTIFACT_SFTP_KEY }}
+          TOKEN_ARTIFACT_SSH_HOST_KEY: ${{ secrets.TOKEN_ARTIFACT_SSH_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TOKEN_ARTIFACT_SFTP_KEY" || -z "$TOKEN_ARTIFACT_SSH_HOST_KEY" ]]; then
+            echo "Token client artifact mirror secrets are not configured." >&2
+            exit 1
+          fi
+          tag="token-client-v$RELEASE_VERSION"
+          root="apps/token-pool-client/release"
+          key="$RUNNER_TEMP/token-artifact-sftp-key"
+          known_hosts="$RUNNER_TEMP/token-artifact-known-hosts"
+          batch="$RUNNER_TEMP/token-artifact-sftp-batch"
+          printf '%s\n' "$TOKEN_ARTIFACT_SFTP_KEY" > "$key"
+          printf '%s\n' "$TOKEN_ARTIFACT_SSH_HOST_KEY" > "$known_hosts"
+          chmod 600 "$key" "$known_hosts"
+          {
+            echo "-mkdir token-client"
+            echo "-mkdir token-client/$tag"
+            echo "cd token-client/$tag"
+            echo "put $root/TokenPoolClient-app-win-x64.zip"
+            echo "put $root/TokenPoolClient-app-win-x64.zip.sha256"
+            echo "put $root/TokenPoolClient-release.json"
+            echo "put $root/TokenPoolClient-win-x64.zip.sha256"
+            for part in "$root"/TokenPoolClient-win-x64.zip.part*; do
+              echo "put $part"
+            done
+          } > "$batch"
+          sftp -q -b "$batch" -i "$key" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$known_hosts" \
+            fmbsm-artifacts@35.180.210.11

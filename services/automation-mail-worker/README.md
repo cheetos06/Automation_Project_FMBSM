@@ -35,6 +35,30 @@ expected Copilot audience/client, and use a tenant listed in
 `COPILOT_ALLOWED_TENANT_IDS`. The pool also enforces `COPILOT_MAX_ACCOUNTS`, so a
 publicly downloadable client credential is not the server's only trust boundary.
 
+## Token client artifact mirror
+
+The HTTP token service also serves immutable, versioned Token Pool Client assets from
+`TOKEN_CLIENT_ARTIFACT_DIR`. It does not expose directory listings and accepts only
+the expected `token-client-v*` paths and asset names. GitHub Actions uploads through
+the separate `fmbsm-artifacts` account, which is chrooted to the artifact directory,
+restricted to SFTP, and has no shell or forwarding access. The client obtains its
+release manifest from GitHub and rejects mirrored bytes with the wrong SHA-256, so
+the mirror cannot authorize an update by itself.
+
+The release workflow requires repository secrets `TOKEN_ARTIFACT_SFTP_KEY` and
+`TOKEN_ARTIFACT_SSH_HOST_KEY`. They are deployment-only credentials and are never
+included in the desktop app.
+Public artifact requests are limited per source IP by
+`TOKEN_CLIENT_DOWNLOADS_PER_HOUR` (120 by default); clients fall back to GitHub if
+the mirror is unavailable or rate-limited.
+
+On a replacement server, configure the restricted account with the uploader's public
+key before deploying the service:
+
+```bash
+sudo bash scripts/configure_artifact_sftp.sh 'ssh-ed25519 AAAA... github-actions-token-client-artifacts'
+```
+
 ## Deploy
 
 Create `.env` from `.env.example`, preserve the existing Gmail App Password, then run
