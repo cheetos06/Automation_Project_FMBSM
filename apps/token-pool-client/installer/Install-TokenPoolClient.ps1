@@ -22,20 +22,68 @@ function Get-AppRelease {
         Select-Object -First 1
 }
 
+function Receive-ReleaseAsset($Asset, [string]$Destination) {
+    $Headers = @{ "User-Agent" = "FMBSM-Token-Pool-Installer"; "Accept" = "application/octet-stream" }
+    if ($env:GITHUB_TOKEN) {
+        $Headers.Authorization = "Bearer $($env:GITHUB_TOKEN)"
+        $Uri = [string]$Asset.url
+    } else {
+        $Uri = [string]$Asset.browser_download_url
+    }
+    if (-not $Uri) { throw "Release asset $($Asset.name) has no download URL." }
+    for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+        try {
+            Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $Destination
+            Invoke-WebRequest -Headers $Headers -Uri $Uri -OutFile $Destination -TimeoutSec 120
+            if (-not (Test-Path -LiteralPath $Destination) -or (Get-Item -LiteralPath $Destination).Length -le 0) {
+                throw "Downloaded asset is empty."
+            }
+            return
+        } catch {
+            if ($Attempt -eq 3) { throw }
+            Write-LauncherLog "Download retry $Attempt/3 for $($Asset.name): $($_.Exception.Message)"
+            Start-Sleep -Seconds (2 * $Attempt)
+        }
+    }
+}
+
 function Install-Release($Release) {
     if (-not $Release) { throw "No Token Pool Client release is available." }
     $Tag = [string]$Release.tag_name
     $Asset = $Release.assets | Where-Object name -eq "TokenPoolClient-win-x64.zip" | Select-Object -First 1
     $ChecksumAsset = $Release.assets | Where-Object name -eq "TokenPoolClient-win-x64.zip.sha256" | Select-Object -First 1
-    if (-not $Asset -or -not $ChecksumAsset) { throw "Release $Tag is missing its Windows asset or checksum." }
+    $Parts = @($Release.assets | Where-Object name -like "TokenPoolClient-win-x64.zip.part*" | Sort-Object name)
+    if ((-not $Asset -and $Parts.Count -eq 0) -or -not $ChecksumAsset) {
+        throw "Release $Tag is missing its Windows asset or checksum."
+    }
     $Destination = Join-Path $VersionsRoot $Tag
     if (-not (Test-Path (Join-Path $Destination "app\TokenPoolClient.exe"))) {
         $Zip = Join-Path $env:TEMP "TokenPoolClient-$Tag.zip"
         $Checksum = Join-Path $env:TEMP "TokenPoolClient-$Tag.sha256"
-        $Headers = @{ "User-Agent" = "FMBSM-Token-Pool-Installer"; "Accept" = "application/octet-stream" }
-        if ($env:GITHUB_TOKEN) { $Headers.Authorization = "Bearer $($env:GITHUB_TOKEN)" }
-        Invoke-WebRequest -Headers $Headers -Uri $Asset.url -OutFile $Zip
-        Invoke-WebRequest -Headers $Headers -Uri $ChecksumAsset.url -OutFile $Checksum
+        if ($Parts.Count -gt 0) {
+            Write-LauncherLog "Downloading $Tag in $($Parts.Count) proxy-safe part(s)"
+            $Combined = [IO.File]::Create($Zip)
+            try {
+                for ($Index = 0; $Index -lt $Parts.Count; $Index++) {
+                    $Part = $Parts[$Index]
+                    $PartFile = Join-Path $env:TEMP "$($Part.name).$PID"
+                    Write-LauncherLog "Downloading part $($Index + 1)/$($Parts.Count)"
+                    Receive-ReleaseAsset $Part $PartFile
+                    $PartStream = [IO.File]::OpenRead($PartFile)
+                    try {
+                        $PartStream.CopyTo($Combined)
+                    } finally {
+                        $PartStream.Dispose()
+                        Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $PartFile
+                    }
+                }
+            } finally {
+                $Combined.Dispose()
+            }
+        } else {
+            Receive-ReleaseAsset $Asset $Zip
+        }
+        Receive-ReleaseAsset $ChecksumAsset $Checksum
         $Expected = ((Get-Content -Raw -LiteralPath $Checksum).Trim() -split '\s+')[0].ToLowerInvariant()
         $Actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Zip).Hash.ToLowerInvariant()
         if ($Expected -ne $Actual) { throw "Downloaded app checksum mismatch." }

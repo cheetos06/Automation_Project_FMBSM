@@ -73,5 +73,33 @@ if (-not $Compressed -or -not (Test-Path -LiteralPath $Zip)) {
 }
 $Hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Zip).Hash.ToLowerInvariant()
 Set-Content -LiteralPath "$Zip.sha256" -Encoding ascii -Value "$Hash  TokenPoolClient-win-x64.zip"
+
+# Corporate proxies can terminate long GitHub asset streams after only a few
+# megabytes. Publish small ordered parts as well as the full ZIP; the installer
+# rejoins them and verifies this same full-file checksum before activation.
+Get-ChildItem -LiteralPath $ReleaseRoot -Filter "TokenPoolClient-win-x64.zip.part*" -ErrorAction SilentlyContinue |
+    Remove-Item -Force
+$ChunkSize = 4MB
+$InputStream = [IO.File]::OpenRead($Zip)
+$PartCount = 0
+try {
+    $Buffer = New-Object byte[] $ChunkSize
+    while (($Read = $InputStream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
+        $PartPath = "${Zip}.part{0:D3}" -f $PartCount
+        $OutputStream = [IO.File]::Create($PartPath)
+        try {
+            $OutputStream.Write($Buffer, 0, $Read)
+        } finally {
+            $OutputStream.Dispose()
+        }
+        $PartCount++
+    }
+} finally {
+    $InputStream.Dispose()
+}
+if ($PartCount -lt 2) {
+    throw "Expected a multi-part client package, created only $PartCount part(s)."
+}
 Write-Output "PACKAGE=$Zip"
 Write-Output "SHA256=$Hash"
+Write-Output "PARTS=$PartCount"
