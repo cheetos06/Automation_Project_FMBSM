@@ -29,8 +29,9 @@ that layer, connects it to the cached runtime with a directory junction, and ret
 the previous version for rollback. Exact dependency pins and a normalized runtime
 fingerprint prevent build timestamps from causing unnecessary full downloads. The
 exact public installer completed a clean office-network installation in 2m22s versus
-the prior 10–13 minutes; an ordinary update completed in 14.52s. A no-change check
-does not download an asset.
+the prior 10–13 minutes; the installed v1.0.5 launcher automatically updated to
+v1.0.7 in 8.04s without downloading the runtime. A no-change check does not download
+an asset.
 
 Production builds also validate `runtime-compatibility.json` against the exact Python
 version, requirements files, and PyInstaller spec. A real runtime change therefore
