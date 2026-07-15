@@ -6,16 +6,26 @@ requirement.
 
 On first use, **Add Microsoft account** opens an isolated Edge profile. The colleague
 completes Microsoft sign-in/MFA once, and the app captures the account's Copilot
-upload/websocket session. On later starts it silently rotates the saved OAuth refresh
-token while Microsoft still permits it. Microsoft SPA refresh tokens have a fixed
-24-hour lifetime; once that lifetime expires, **Renew sign-in & upload all** opens the
-account's dedicated Edge profile for a real sign-in/MFA, captures a new session,
-verifies that the expected account was used, and then uploads it. The client encrypts
-the renewed session to the pinned server certificate and HMAC-signs the request. It
-then shows the AWS pool's accounts, turn totals, and cooldown state. The upload key is
-never sent on the wire.
+upload/websocket session. The app then starts with Windows and remains in the Windows
+notification area (normally under the hidden-icons arrow).
 
-The launcher checks only GitHub releases whose tag begins with `token-client-v`.
+At 04:45 and 09:45 local computer time, the app automatically renews only exact
+`@forvismazars.com` and `@mazars.fr` work accounts. This is a fresh Microsoft browser
+authorization that starts a new fixed 24-hour SPA lifetime; it is not merely a refresh-
+token grant, which cannot extend that lifetime. The dedicated Edge profile normally
+completes the new authorization headlessly with its saved Microsoft SSO session. If
+Microsoft requires a password, MFA, consent, or another interaction, Edge opens
+visibly. An incomplete attempt ends with a Windows notification telling the colleague
+to sign in. ISGA and all non-work accounts are manual-only and can be renewed from the
+app with **Renew & upload all now**.
+
+Every renewed identity is checked against the expected Microsoft tenant and object ID
+before upload. The client encrypts the session to the pinned server certificate and
+HMAC-signs the request. It then shows the AWS pool's accounts, turn totals, and
+cooldown state. The upload key is never sent on the wire.
+
+While resident, the client performs one lightweight update check per hour. The
+launcher checks only GitHub releases whose tag begins with `token-client-v`.
 Changes to any other app/service in this monorepo do not trigger a client update.
 Downloaded ZIPs are SHA-256 verified and installed under `%LOCALAPPDATA%`; the prior
 working version remains available if an update fails.
@@ -45,7 +55,9 @@ changes keep using the cached runtime.
 The AWS mirror is only a speed layer: GitHub remains the version authority, and every
 mirrored package must match the SHA-256 value from the GitHub release manifest before
 activation. Progress and fallback details are written to
-`%LOCALAPPDATA%\FMBSM\TokenPoolClient\launcher.log`.
+`%LOCALAPPDATA%\FMBSM\TokenPoolClient\launcher.log`. Scheduled authorization and
+upload progress is written in real time to
+`%LOCALAPPDATA%\FMBSM\TokenPoolClient\client.log`.
 
 Install without Git or administrator rights:
 

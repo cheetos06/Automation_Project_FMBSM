@@ -1,4 +1,8 @@
-param([switch]$InstallOnly)
+param(
+    [switch]$InstallOnly,
+    [switch]$Background,
+    [int]$WaitForProcessId = 0
+)
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -14,6 +18,10 @@ $AllowedMirrorHost = "35.180.210.11"
 $ParallelDownloads = 8
 $DirectInstallerRun = [string]::IsNullOrWhiteSpace([string]$MyInvocation.MyCommand.Path)
 New-Item -ItemType Directory -Force -Path $VersionsRoot, $RuntimesRoot | Out-Null
+
+if ($WaitForProcessId -gt 0) {
+    Wait-Process -Id $WaitForProcessId -ErrorAction SilentlyContinue
+}
 
 function Write-LauncherLog([string]$Message) {
     "{0:o} {1}" -f [DateTime]::UtcNow, $Message | Add-Content -LiteralPath $LogFile -Encoding utf8
@@ -597,7 +605,12 @@ try {
         Write-LauncherLog "Start Menu shortcut: $ShortcutPath"
     }
     if (-not $InstallOnly) {
-        Start-Process -FilePath (Join-Path $AppPath "app\TokenPoolClient.exe") -WorkingDirectory (Join-Path $AppPath "app")
+        $Executable = Join-Path $AppPath "app\TokenPoolClient.exe"
+        if ($Background) {
+            Start-Process -FilePath $Executable -ArgumentList "--background" -WorkingDirectory (Join-Path $AppPath "app")
+        } else {
+            Start-Process -FilePath $Executable -WorkingDirectory (Join-Path $AppPath "app")
+        }
     }
 } catch {
     Write-LauncherLog "Update failed: $($_.Exception.Message)"
@@ -605,7 +618,13 @@ try {
         $Fallback = Get-Content -Raw $CurrentFile | ConvertFrom-Json
         $Executable = Join-Path ([string]$Fallback.path) "app\TokenPoolClient.exe"
         if (Test-Path $Executable) {
-            if (-not $InstallOnly) { Start-Process -FilePath $Executable -WorkingDirectory (Split-Path $Executable) }
+            if (-not $InstallOnly) {
+                if ($Background) {
+                    Start-Process -FilePath $Executable -ArgumentList "--background" -WorkingDirectory (Split-Path $Executable)
+                } else {
+                    Start-Process -FilePath $Executable -WorkingDirectory (Split-Path $Executable)
+                }
+            }
             exit 0
         }
     }
