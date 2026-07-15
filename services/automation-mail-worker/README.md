@@ -14,6 +14,13 @@ Every accepted request receives an acknowledgement with a job ID. FS progress is
 written every 20 seconds to `data/mail/state/job-status/<job-id>.json` and to the
 systemd journal. The final FS outputs and diagnostics are returned in one ZIP.
 
+The worker accepts trigger subjects only from exact addresses in
+`AUTHORIZED_JOB_SENDERS` or exact domains in `AUTHORIZED_JOB_SENDER_DOMAINS`.
+At least one allowlist must be configured or the worker refuses to start. Matching is
+case-insensitive and exact: allowing `mazars.fr` does not allow a subdomain or a name
+such as `mazars.fr.attacker.example`. Unauthorized matching messages are marked read
+without starting a job or sending a reply.
+
 ## Shared Copilot pool
 
 The token API installs immutable, validated session versions beneath
