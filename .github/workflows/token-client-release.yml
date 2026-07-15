@@ -48,8 +48,18 @@ jobs:
         run: |
           $exe = "apps/token-pool-client/dist/TokenPoolClient/TokenPoolClient.exe"
           if (-not (Test-Path $exe)) { throw "Packaged executable missing." }
-          & $exe --help
-          if ($LASTEXITCODE -ne 0) { throw "Packaged CLI smoke test failed." }
+          # PyInstaller builds a GUI-subsystem executable, so direct invocation
+          # does not reliably populate PowerShell's $LASTEXITCODE. Use a clean,
+          # empty account store and wait on the actual process. --refresh-all
+          # loads the embedded release configuration without making a network
+          # request when no accounts have been enrolled yet.
+          $env:TOKEN_POOL_CLIENT_DATA = Join-Path $env:RUNNER_TEMP "token-client-smoke"
+          $env:TOKEN_POOL_CLIENT_CONFIG = (Resolve-Path "apps/token-pool-client/release/TokenPoolClient-win-x64/client-config.json").Path
+          New-Item -ItemType Directory -Force $env:TOKEN_POOL_CLIENT_DATA | Out-Null
+          $process = Start-Process -FilePath $exe -ArgumentList "--refresh-all" -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Packaged CLI smoke test failed with exit code $($process.ExitCode)."
+          }
       - name: Publish app-specific release
         shell: pwsh
         env:
