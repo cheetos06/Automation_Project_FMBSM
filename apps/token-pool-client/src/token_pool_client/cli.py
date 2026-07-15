@@ -4,6 +4,7 @@ import argparse
 import time
 from pathlib import Path
 
+from . import __version__
 from .app import run as run_app
 from .bundle import create_bundle
 from .legacy import import_build2
@@ -14,6 +15,7 @@ from .upload import load_config, server_status, upload_bundle
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="FMBSM Copilot Token Pool Client")
+    parser.add_argument("--version", action="version", version=f"FMBSM Token Pool Client {__version__}")
     parser.add_argument("--legacy-build2", type=Path, help="Import and upload an existing OPTIMDA Build 2 account pool")
     parser.add_argument("--skip-legacy-refresh", action="store_true")
     parser.add_argument("--refresh-all", action="store_true", help="Refresh/upload configured accounts without the GUI")
