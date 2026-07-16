@@ -88,6 +88,25 @@ def bundle_bytes(
 
 
 class RegistryTests(unittest.TestCase):
+    def test_turn_usage_distinguishes_hour_day_and_lifetime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            registry = CopilotRegistry(Path(temporary))
+            installed = install_bundle(bundle_bytes(), registry, remote_address="127.0.0.1")
+            base = time.time()
+            for dispatched_at in (base - 2 * 60 * 60, base - 30 * 60):
+                with patch("copilot_service.registry.time.time", return_value=dispatched_at):
+                    allowed = registry.reserve_turn(
+                        installed.account.account_id,
+                        turn_limit=100,
+                        window_seconds=3600,
+                        cooldown_seconds=3600,
+                    )
+                self.assertTrue(allowed[0])
+            usage = registry.turn_usage(now=base)[installed.account.account_id]
+            self.assertEqual(usage["turns_last_hour"], 1)
+            self.assertEqual(usage["turns_last_24_hours"], 2)
+            self.assertEqual(registry.get_account(installed.account.account_id).total_turns, 2)
+
     def test_copilot_health_tests_cannot_be_accidentally_queued_twice(self) -> None:
         registry = MagicMock()
         registry.list_accounts.return_value = [MagicMock(account_id="account-test")]
@@ -163,13 +182,14 @@ class RegistryTests(unittest.TestCase):
                         admin_snapshot(AdminConfig(endpoint, "x" * 32, root / "unused.pem"))
                     client_preflight(
                         client_config,
-                        event="scheduled_refresh",
-                        account_ids=["account-test"],
-                        scheduled_slot="2026-07-16T09:45+01:00",
+                        event="startup",
+                        account_ids=[],
                         status={"busy": False},
                     )
                     initial = admin_snapshot(admin_config)
                     self.assertEqual(len(initial["clients"]), 1)
+                    self.assertEqual(initial["clients"][0]["account_ids"], [])
+                    self.assertEqual(initial["clients"][0]["account_usernames"], [])
                     client_id = initial["clients"][0]["client_id"]
                     created = admin_create_commands(
                         admin_config,
@@ -293,6 +313,11 @@ class RegistryTests(unittest.TestCase):
             self.assertTrue(allowed2[0])
             self.assertFalse(denied[0])
             self.assertEqual(registry.status()["recent_turns"], 2)
+            self.assertEqual(registry.status()["turns_last_hour"], 2)
+            self.assertEqual(registry.status()["turns_last_24_hours"], 2)
+            usage = registry.turn_usage()[installed.account.account_id]
+            self.assertEqual(usage["turns_last_hour"], 2)
+            self.assertEqual(usage["turns_last_24_hours"], 2)
             reopened = CopilotRegistry(Path(temporary))
             self.assertEqual(reopened.status()["recent_turns"], 2)
 

@@ -443,6 +443,7 @@ class TokenApiHandler(BaseHTTPRequestHandler):
         now = time.time()
         account_records = registry.list_accounts(enabled_only=False)
         account_by_id = {record.account_id: record for record in account_records}
+        turn_usage = registry.turn_usage(now=now)
         accounts: list[dict[str, Any]] = []
         for record in account_records:
             value = record.as_public_dict(now=now)
@@ -452,6 +453,10 @@ class TokenApiHandler(BaseHTTPRequestHandler):
                     "username": record.username,
                     "last_error": record.last_error,
                     "uploaded_at": record.uploaded_at,
+                    **turn_usage.get(
+                        record.account_id,
+                        {"turns_last_hour": 0, "turns_last_24_hours": 0},
+                    ),
                 }
             )
             if (

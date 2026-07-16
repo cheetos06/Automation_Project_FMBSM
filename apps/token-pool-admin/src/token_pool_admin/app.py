@@ -199,7 +199,18 @@ class TokenPoolAdminApp:
             text="Each ping sends one minimal real prompt and consumes one recorded Copilot turn.",
             foreground=MUTED,
         ).pack(side="right")
-        columns = ("account", "runtime", "access", "authorization", "cooldown", "turns", "uploaded", "error")
+        columns = (
+            "account",
+            "runtime",
+            "access",
+            "authorization",
+            "cooldown",
+            "hour_turns",
+            "day_turns",
+            "lifetime_turns",
+            "uploaded",
+            "error",
+        )
         self.accounts_tree = self._tree(
             self.accounts_tab,
             columns,
@@ -209,7 +220,9 @@ class TokenPoolAdminApp:
                 ("access", "Access token", 135),
                 ("authorization", "Authorization", 145),
                 ("cooldown", "Cooldown", 105),
-                ("turns", "Turns", 65),
+                ("hour_turns", "Last hour", 75),
+                ("day_turns", "Last 24h", 75),
+                ("lifetime_turns", "Lifetime", 75),
                 ("uploaded", "Last upload", 140),
                 ("error", "Last error", 300),
             ),
@@ -350,7 +363,11 @@ class TokenPoolAdminApp:
         available = int(pool.get("available_account_count") or 0)
         total = int(pool.get("account_count") or 0)
         self.card_pool["value"].configure(text=f"{available} / {total}", fg=GREEN if available == total and total else AMBER)
-        self.card_pool["detail"].configure(text=f"{int(pool.get('recent_turns') or 0)} turns during the last hour")
+        hour_turns = int(pool.get("turns_last_hour") or pool.get("recent_turns") or 0)
+        day_turns = int(pool.get("turns_last_24_hours") or 0)
+        self.card_pool["detail"].configure(
+            text=f"{hour_turns} last hour · {day_turns} last 24h"
+        )
         if tests:
             latest = tests[0] if isinstance(tests[0], dict) else {}
             progress = latest.get("progress") if isinstance(latest.get("progress"), dict) else {}
@@ -426,6 +443,8 @@ class TokenPoolAdminApp:
                     _remaining(account.get("access_expires_at"), value.get("now")),
                     _remaining(account.get("refresh_expires_at"), value.get("now"), unknown="Legacy/unknown"),
                     _remaining(account.get("cooldown_until"), value.get("now"), past="No", unknown="No"),
+                    account.get("turns_last_hour") or 0,
+                    account.get("turns_last_24_hours") or 0,
                     account.get("total_turns") or 0,
                     _time_text(account.get("uploaded_at")),
                     str(account.get("last_error") or "")[:180],

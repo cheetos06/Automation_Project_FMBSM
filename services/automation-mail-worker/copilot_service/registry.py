@@ -12,6 +12,7 @@ from typing import Any, Iterator
 
 
 SCHEMA_VERSION = 1
+TURN_HISTORY_RETENTION_SECONDS = 30 * 24 * 60 * 60
 
 
 def default_data_dir() -> Path:
@@ -691,9 +692,13 @@ class CopilotRegistry:
                     (now, account_id),
                 )
 
+            # Cooldown decisions use ``window_seconds`` (normally one hour),
+            # but dashboard reporting also needs a truthful 24-hour view.
+            # Keep a bounded 30-day audit window instead of deleting everything
+            # older than the active cooldown window on every reservation.
             connection.execute(
-                "DELETE FROM turns WHERE account_id=? AND dispatched_at<?",
-                (account_id, now - window_seconds),
+                "DELETE FROM turns WHERE dispatched_at<?",
+                (now - TURN_HISTORY_RETENTION_SECONDS,),
             )
             count = self._turn_count(connection, account_id, now - window_seconds)
             if count >= turn_limit:
@@ -743,12 +748,14 @@ class CopilotRegistry:
     def status(self) -> dict[str, Any]:
         now = time.time()
         accounts = self.list_accounts(enabled_only=False)
+        usage = self.turn_usage(now=now)
         with self._connect() as connection:
-            recent_turns = connection.execute(
-                "SELECT COUNT(*) FROM turns WHERE dispatched_at>=?",
-                (now - 3600,),
-            ).fetchone()[0]
             upload_count = connection.execute("SELECT COUNT(*) FROM uploads").fetchone()[0]
+        account_values: list[dict[str, Any]] = []
+        for account in accounts:
+            value = account.as_public_dict(now=now)
+            value.update(usage.get(account.account_id, _empty_turn_usage()))
+            account_values.append(value)
         return {
             "schema_version": SCHEMA_VERSION,
             "now": now,
@@ -760,9 +767,36 @@ class CopilotRegistry:
                 and (account.access_expires_at > now + 60 or account.refresh_expires_at is None or account.refresh_expires_at > now)
                 for account in accounts
             ),
-            "recent_turns": int(recent_turns),
+            # ``recent_turns`` remains for older clients and means last hour.
+            "recent_turns": sum(item["turns_last_hour"] for item in usage.values()),
+            "turns_last_hour": sum(item["turns_last_hour"] for item in usage.values()),
+            "turns_last_24_hours": sum(
+                item["turns_last_24_hours"] for item in usage.values()
+            ),
             "upload_count": int(upload_count),
-            "accounts": [account.as_public_dict(now=now) for account in accounts],
+            "accounts": account_values,
+        }
+
+    def turn_usage(self, *, now: float | None = None) -> dict[str, dict[str, int]]:
+        current = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT account_id,
+                       SUM(CASE WHEN dispatched_at>=? THEN 1 ELSE 0 END) AS last_hour,
+                       SUM(CASE WHEN dispatched_at>=? THEN 1 ELSE 0 END) AS last_day
+                FROM turns
+                WHERE dispatched_at>=?
+                GROUP BY account_id
+                """,
+                (current - 3600, current - 24 * 60 * 60, current - 24 * 60 * 60),
+            ).fetchall()
+        return {
+            str(row["account_id"]): {
+                "turns_last_hour": int(row["last_hour"] or 0),
+                "turns_last_24_hours": int(row["last_day"] or 0),
+            }
+            for row in rows
         }
 
     @staticmethod
@@ -792,3 +826,7 @@ class CopilotRegistry:
             last_used_at=float(row["last_used_at"]) if row["last_used_at"] is not None else None,
             total_turns=int(row["total_turns"] or 0),
         )
+
+
+def _empty_turn_usage() -> dict[str, int]:
+    return {"turns_last_hour": 0, "turns_last_24_hours": 0}
