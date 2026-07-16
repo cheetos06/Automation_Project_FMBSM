@@ -487,6 +487,13 @@ class TokenApiHandler(BaseHTTPRequestHandler):
             item["seconds_since_seen"] = round(max(0.0, now - float(client["last_seen_at"])), 1)
             item["active_command_count"] = active_by_client.get(str(client["client_id"]), 0)
             clients.append(item)
+        pool_status = registry.status()
+        # The registry's general availability count is intentionally optimistic when a
+        # refresh token has not yet been exercised.  The admin view has stronger evidence:
+        # a recorded refresh failure means the account is not currently usable.
+        pool_status["available_account_count"] = sum(
+            bool(account.get("runtime_available")) for account in accounts
+        )
         self._json(
             HTTPStatus.OK,
             {
@@ -494,7 +501,7 @@ class TokenApiHandler(BaseHTTPRequestHandler):
                 "now": now,
                 "server": _server_metrics(self.server.started_at),
                 "pool": {
-                    **registry.status(),
+                    **pool_status,
                     "accounts": accounts,
                 },
                 "clients": clients,

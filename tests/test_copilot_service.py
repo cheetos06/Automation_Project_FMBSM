@@ -150,6 +150,16 @@ class RegistryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             registry = CopilotRegistry(root / "registry")
+            expired = install_bundle(bundle_bytes(), registry, remote_address="127.0.0.1")
+            registry.update_token_state(
+                expired.account.account_id,
+                access_expires_at=time.time() - 60,
+                refresh_expires_at=time.time() + 3600,
+                error="token_refresh_failed: interactive sign-in required",
+            )
+            # The general scheduler remains optimistic until it tries the refresh,
+            # while the admin dashboard must reflect the recorded failure immediately.
+            self.assertEqual(registry.status()["available_account_count"], 1)
             status_store = JobStatusStore(root / "job-status")
             artifact_root = root / "artifacts"
             artifact_root.mkdir()
@@ -190,6 +200,7 @@ class RegistryTests(unittest.TestCase):
                     self.assertEqual(len(initial["clients"]), 1)
                     self.assertEqual(initial["clients"][0]["account_ids"], [])
                     self.assertEqual(initial["clients"][0]["account_usernames"], [])
+                    self.assertEqual(initial["pool"]["available_account_count"], 0)
                     client_id = initial["clients"][0]["client_id"]
                     created = admin_create_commands(
                         admin_config,
