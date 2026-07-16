@@ -148,6 +148,19 @@ class CopilotRegistry:
                     bundle_sha256 TEXT NOT NULL,
                     remote_address TEXT
                 );
+                CREATE TABLE IF NOT EXISTS client_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_id TEXT NOT NULL,
+                    received_at REAL NOT NULL,
+                    observed_at REAL NOT NULL,
+                    event TEXT NOT NULL,
+                    scheduled_slot TEXT,
+                    app_version TEXT,
+                    account_ids TEXT,
+                    remote_address TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_client_events_client_time
+                    ON client_events(client_id, received_at DESC);
                 """
             )
             connection.execute(
@@ -230,6 +243,74 @@ class CopilotRegistry:
         with self._connect() as connection:
             rows = connection.execute(query).fetchall()
         return [self._record(row) for row in rows]
+
+    def record_client_event(
+        self,
+        *,
+        client_id: str,
+        observed_at: float,
+        event: str,
+        scheduled_slot: str | None,
+        app_version: str | None,
+        account_ids: list[str],
+        remote_address: str | None,
+    ) -> int:
+        """Persist a small signed client-presence event for operational diagnosis."""
+
+        now = time.time()
+        with self._connect(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO client_events(
+                    client_id, received_at, observed_at, event, scheduled_slot,
+                    app_version, account_ids, remote_address
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    client_id,
+                    now,
+                    observed_at,
+                    event,
+                    scheduled_slot,
+                    app_version,
+                    ",".join(account_ids),
+                    remote_address,
+                ),
+            )
+            # Two scheduled events per day are expected. Ninety days keeps the
+            # diagnostic table small while leaving enough history for audits.
+            connection.execute("DELETE FROM client_events WHERE received_at < ?", (now - 90 * 24 * 60 * 60,))
+            return int(cursor.lastrowid)
+
+    def recent_client_events(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        bounded_limit = min(max(1, int(limit)), 200)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, client_id, received_at, observed_at, event,
+                       scheduled_slot, app_version, account_ids, remote_address
+                FROM client_events
+                ORDER BY received_at DESC, id DESC
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "client_id": str(row["client_id"]),
+                "received_at": float(row["received_at"]),
+                "observed_at": float(row["observed_at"]),
+                "event": str(row["event"]),
+                "scheduled_slot": str(row["scheduled_slot"]) if row["scheduled_slot"] else None,
+                "app_version": str(row["app_version"]) if row["app_version"] else None,
+                "account_ids": [
+                    value for value in str(row["account_ids"] or "").split(",") if value
+                ],
+                "remote_address": str(row["remote_address"]) if row["remote_address"] else None,
+            }
+            for row in rows
+        ]
 
     def update_token_state(
         self,

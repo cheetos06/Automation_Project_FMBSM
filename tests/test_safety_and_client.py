@@ -59,8 +59,10 @@ from token_pool_client.storage import ClientAccount  # noqa: E402
 from token_pool_client.transport_crypto import encrypt_bundle  # noqa: E402
 from token_pool_client.upload import (  # noqa: E402
     ClientConfig,
+    ServerRejectedError,
     TransientNetworkError,
     _request_with_retry,
+    client_preflight,
     is_transient_network_error,
 )
 from copilot_service.transport_crypto import EnvelopeError, decrypt_envelope, load_private_key  # noqa: E402
@@ -431,7 +433,7 @@ class ClientBundleTests(unittest.TestCase):
         app.log = MagicMock()
         app._fresh_renewal = MagicMock()
         with patch(
-            "token_pool_client.app.server_status",
+            "token_pool_client.app.client_preflight",
             side_effect=TransientNetworkError("offline"),
         ):
             result = app._renew_and_upload([account], automatic=True)
@@ -455,7 +457,7 @@ class ClientBundleTests(unittest.TestCase):
         app.store = MagicMock()
         app.log = MagicMock()
         app._fresh_renewal = MagicMock(return_value=account)
-        with patch("token_pool_client.app.server_status", return_value={"pool": {}}), patch(
+        with patch("token_pool_client.app.client_preflight", return_value={"pool": {}}), patch(
             "token_pool_client.app.create_bundle", return_value=b"bundle"
         ), patch(
             "token_pool_client.app.upload_bundle",
@@ -466,6 +468,24 @@ class ClientBundleTests(unittest.TestCase):
         self.assertTrue(account.pending_upload)
         self.assertIsNone(account.last_error)
         self.assertGreaterEqual(app.store.upsert.call_count, 1)
+
+    def test_client_preflight_falls_back_when_server_endpoint_is_not_deployed(self) -> None:
+        config = ClientConfig("http://example.invalid", "key", Path("unused"), "repo")
+        with patch(
+            "token_pool_client.upload._request_with_retry",
+            side_effect=ServerRejectedError(404, {"error": "not_found"}),
+        ), patch(
+            "token_pool_client.upload.server_status",
+            return_value={"ok": True, "pool": {}},
+        ) as fallback:
+            result = client_preflight(
+                config,
+                event="scheduled_refresh",
+                account_ids=["account-test"],
+                scheduled_slot="2026-07-16T09:45+01:00",
+            )
+        self.assertTrue(result["ok"])
+        fallback.assert_called_once_with(config)
 
     def test_bootstrap_upload_clicks_only_one_explicit_control(self) -> None:
         page = MagicMock()

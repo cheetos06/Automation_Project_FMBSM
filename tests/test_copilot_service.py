@@ -13,15 +13,19 @@ import urllib.request
 import zipfile
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVICE = ROOT / "services" / "automation-mail-worker"
+CLIENT = ROOT / "apps" / "token-pool-client" / "src"
 sys.path.insert(0, str(SERVICE))
+sys.path.insert(0, str(CLIENT))
 
 from copilot_service.registry import CopilotRegistry  # noqa: E402
 from copilot_service.session_bundle import BundleValidationError, install_bundle  # noqa: E402
 from copilot_service.token_api import TokenApiServer  # noqa: E402
+from token_pool_client.upload import ClientConfig, client_preflight  # noqa: E402
 
 
 def fake_jwt(claims: dict[str, object]) -> str:
@@ -75,6 +79,58 @@ def bundle_bytes(
 
 
 class RegistryTests(unittest.TestCase):
+    def test_signed_client_preflight_records_scheduled_presence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry = CopilotRegistry(root / "registry")
+            artifact_root = root / "artifacts"
+            artifact_root.mkdir()
+            server = TokenApiServer(
+                ("127.0.0.1", 0),
+                registry=registry,
+                upload_key="x" * 32,
+                status_store=object(),
+                requests_per_minute=10,
+                transport_private_key=None,
+                session_validator=object(),
+                maximum_accounts=1,
+                artifact_root=artifact_root,
+                artifact_requests_per_hour=10,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            config = ClientConfig(
+                f"http://127.0.0.1:{server.server_port}",
+                "x" * 32,
+                root / "unused-certificate.pem",
+                "repo",
+            )
+            try:
+                with patch.dict(
+                    "os.environ",
+                    {
+                        "TOKEN_POOL_CLIENT_DATA": str(root / "client"),
+                        "NO_PROXY": "127.0.0.1,localhost",
+                        "no_proxy": "127.0.0.1,localhost",
+                    },
+                ):
+                    response = client_preflight(
+                        config,
+                        event="scheduled_refresh",
+                        account_ids=["account-test"],
+                        scheduled_slot="2026-07-16T09:45+01:00",
+                    )
+                self.assertTrue(response["ok"])
+                events = registry.recent_client_events()
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["event"], "scheduled_refresh")
+                self.assertEqual(events[0]["account_ids"], ["account-test"])
+                self.assertEqual(events[0]["scheduled_slot"], "2026-07-16T09:45+01:00")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
     def test_bundle_install_and_turn_cooldown_are_durable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             registry = CopilotRegistry(Path(temporary))

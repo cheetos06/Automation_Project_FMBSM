@@ -35,6 +35,7 @@ from .storage import AccountStore, ClientAccount
 from .tray import NotificationTray
 from .upload import (
     ClientConfig,
+    client_preflight,
     is_transient_network_error,
     load_config,
     server_status,
@@ -345,11 +346,23 @@ class TokenPoolApp:
         renewed.last_uploaded_at = account.last_uploaded_at
         return renewed
 
-    def _renew_and_upload(self, accounts: list[ClientAccount], *, automatic: bool) -> RenewalBatchResult:
+    def _renew_and_upload(
+        self,
+        accounts: list[ClientAccount],
+        *,
+        automatic: bool,
+        client_event: str = "refresh_preflight",
+        scheduled_slot: str | None = None,
+    ) -> RenewalBatchResult:
         if not self.config:
             raise RuntimeError("Client configuration is unavailable")
         try:
-            server_status(self.config)
+            client_preflight(
+                self.config,
+                event=client_event,
+                account_ids=[account.account_id for account in accounts],
+                scheduled_slot=scheduled_slot,
+            )
         except Exception as exc:
             if _is_transient_failure(exc):
                 self.log(f"Network/AWS preflight unavailable; renewal remains pending: {exc}")
@@ -419,7 +432,11 @@ class TokenPoolApp:
 
         self._background(
             "Renewing all accounts...",
-            lambda: self._renew_and_upload(accounts, automatic=False),
+            lambda: self._renew_and_upload(
+                accounts,
+                automatic=False,
+                client_event="manual_all_refresh",
+            ),
             on_complete=completed,
         )
 
@@ -435,7 +452,11 @@ class TokenPoolApp:
 
         self._background(
             "Renewing work account...",
-            lambda: self._renew_and_upload(accounts, automatic=True),
+            lambda: self._renew_and_upload(
+                accounts,
+                automatic=True,
+                client_event="manual_work_refresh",
+            ),
             on_complete=completed,
             show_error=False,
         )
@@ -617,7 +638,12 @@ class TokenPoolApp:
                 self.log(f"Scheduled work-account renewal {action} for slot {key}.")
                 self._background(
                     "Scheduled renewal...",
-                    lambda: self._renew_and_upload(accounts, automatic=True),
+                    lambda: self._renew_and_upload(
+                        accounts,
+                        automatic=True,
+                        client_event="scheduled_retry" if pending_this_slot else "scheduled_refresh",
+                        scheduled_slot=key,
+                    ),
                     on_complete=completed,
                     show_error=False,
                 )

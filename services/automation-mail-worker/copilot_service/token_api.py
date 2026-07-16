@@ -44,6 +44,10 @@ TOKEN_CLIENT_ASSET = re.compile(
     r"release\.json"
     r")\Z"
 )
+MAX_CLIENT_EVENT_BYTES = 4096
+CLIENT_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
+CLIENT_EVENT_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,47}\Z")
+CLIENT_ACCOUNT_ID_PATTERN = re.compile(r"account-[A-Za-z0-9._-]{1,80}\Z")
 
 
 class SlidingWindowRateLimiter:
@@ -158,6 +162,9 @@ class TokenApiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path.rstrip("/")
+        if path == "/v1/client-events":
+            self._receive_client_event()
+            return
         if path != "/v1/accounts/session":
             self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
             return
@@ -250,6 +257,90 @@ class TokenApiHandler(BaseHTTPRequestHandler):
                 "account": installed.account.as_public_dict(),
                 "bundle_sha256": installed.bundle_sha256,
                 "file_count": installed.file_count,
+                "pool": self.server.registry.status(),
+            },
+        )
+
+    def _receive_client_event(self) -> None:
+        """Record one signed diagnostic event without receiving credentials or tokens."""
+
+        rate_key = f"client-event:{self.client_address[0]}"
+        if not self.server.rate_limiter.allow(rate_key):
+            self._json(HTTPStatus.TOO_MANY_REQUESTS, {"ok": False, "error": "rate_limited"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._json(HTTPStatus.LENGTH_REQUIRED, {"ok": False, "error": "invalid_content_length"})
+            return
+        if length <= 0 or length > MAX_CLIENT_EVENT_BYTES:
+            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"ok": False, "error": "event_too_large"})
+            return
+        self.connection.settimeout(10)
+        body = self.rfile.read(length)
+        if len(body) != length:
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "incomplete_body"})
+            return
+        if not self._authenticated(body):
+            return
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_event_json"})
+            return
+        if not isinstance(payload, dict):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_event"})
+            return
+
+        client_id = str(payload.get("client_id") or "").lower()
+        event = str(payload.get("event") or "").lower()
+        app_version = str(payload.get("app_version") or "")[:64] or None
+        scheduled_slot = str(payload.get("scheduled_slot") or "")[:64] or None
+        try:
+            observed_at = float(payload.get("observed_at"))
+        except (TypeError, ValueError):
+            observed_at = 0.0
+        raw_account_ids = payload.get("account_ids")
+        account_ids = (
+            list(dict.fromkeys(str(value) for value in raw_account_ids))
+            if isinstance(raw_account_ids, list)
+            else []
+        )
+        valid = bool(
+            CLIENT_ID_PATTERN.fullmatch(client_id)
+            and CLIENT_EVENT_PATTERN.fullmatch(event)
+            and observed_at > 0
+            and abs(time.time() - observed_at) <= 2 * 24 * 60 * 60
+            and len(account_ids) <= 20
+            and all(CLIENT_ACCOUNT_ID_PATTERN.fullmatch(value) for value in account_ids)
+            and (scheduled_slot is None or not any(ord(character) < 32 for character in scheduled_slot))
+        )
+        if not valid:
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_event"})
+            return
+        event_id = self.server.registry.record_client_event(
+            client_id=client_id,
+            observed_at=observed_at,
+            event=event,
+            scheduled_slot=scheduled_slot,
+            app_version=app_version,
+            account_ids=account_ids,
+            remote_address=self.client_address[0],
+        )
+        LOGGER.info(
+            "Recorded client event id=%s client=%s event=%s slot=%s accounts=%s remote=%s",
+            event_id,
+            client_id[:10],
+            event,
+            scheduled_slot or "-",
+            len(account_ids),
+            self.client_address[0],
+        )
+        self._json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "event_id": event_id,
                 "pool": self.server.registry.status(),
             },
         )

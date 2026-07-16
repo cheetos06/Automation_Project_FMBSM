@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .storage import application_dir, executable_dir
 from .transport_crypto import ENVELOPE_CONTENT_TYPE, encrypt_bundle
 
@@ -28,6 +29,13 @@ class ClientConfig:
 
 class TransientNetworkError(RuntimeError):
     """A temporary internet/AWS failure that should be retried without blaming the token."""
+
+
+class ServerRejectedError(RuntimeError):
+    def __init__(self, status_code: int, detail: dict[str, Any]) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"Server rejected the request: {detail}")
 
 
 _TRANSIENT_MARKERS = (
@@ -122,6 +130,72 @@ def server_status(config: ClientConfig) -> dict[str, Any]:
     )
 
 
+def client_preflight(
+    config: ClientConfig,
+    *,
+    event: str,
+    account_ids: list[str],
+    scheduled_slot: str | None = None,
+) -> dict[str, Any]:
+    """Report one signed presence event and obtain pool status in the same request.
+
+    Older servers do not have the diagnostic endpoint. Falling back to the
+    existing status request keeps deployment order safe and never blocks a
+    renewal merely because server telemetry has not been deployed yet.
+    """
+
+    body = json.dumps(
+        {
+            "client_id": _client_installation_id(),
+            "observed_at": time.time(),
+            "event": event,
+            "scheduled_slot": scheduled_slot,
+            "app_version": __version__,
+            "account_ids": list(dict.fromkeys(account_ids)),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    try:
+        return _request_with_retry(
+            lambda: _sign(
+                urllib.request.Request(
+                    config.endpoint + "/v1/client-events",
+                    data=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "FMBSM-Token-Pool-Client/1",
+                    },
+                    method="POST",
+                ),
+                config.upload_key,
+                body,
+            ),
+            config,
+            timeout_seconds=4,
+            attempts=2,
+        )
+    except ServerRejectedError as exc:
+        if exc.status_code != 404 or exc.detail.get("error") != "not_found":
+            raise
+        return server_status(config)
+
+
+def _client_installation_id() -> str:
+    path = application_dir() / "client-id.txt"
+    try:
+        value = uuid.UUID(path.read_text(encoding="ascii").strip()).hex
+        return value
+    except (OSError, ValueError):
+        pass
+    value = uuid.uuid4().hex
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(value + "\n", encoding="ascii")
+    temporary.replace(path)
+    return value
+
+
 def _sign(request: urllib.request.Request, key: str, body: bytes) -> urllib.request.Request:
     timestamp = str(int(time.time()))
     nonce = uuid.uuid4().hex
@@ -180,7 +254,7 @@ def _open_json(
             detail = json.loads(exc.read().decode("utf-8"))
         except Exception:
             detail = {"error": str(exc)}
-        raise RuntimeError(f"Server rejected the request: {detail}") from exc
+        raise ServerRejectedError(exc.code, detail) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise TransientNetworkError(
             "The internet or AWS token service is temporarily unavailable. The app will retry automatically."
