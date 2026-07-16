@@ -38,7 +38,7 @@ from .upload_validation import MicrosoftSessionValidator, SessionProofUnavailabl
 
 
 LOGGER = logging.getLogger("copilot-token-api")
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 TOKEN_CLIENT_DOWNLOAD_PREFIX = "/downloads/token-client/"
 TOKEN_CLIENT_TAG = re.compile(r"token-client-v[0-9]+\.[0-9]+\.[0-9]+(?:[-A-Za-z0-9.]*)?\Z")
 TOKEN_CLIENT_ASSET = re.compile(
