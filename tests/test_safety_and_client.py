@@ -46,6 +46,7 @@ from token_pool_client.app import (  # noqa: E402
 )
 from token_pool_client.bootstrap import (  # noqa: E402
     BrowserConnectivityError,
+    explicit_authentication_required,
     navigate,
     upload_image_or_pause,
 )
@@ -493,6 +494,20 @@ class ClientBundleTests(unittest.TestCase):
         usable.goto.side_effect = PlaywrightTimeoutError("timed out")
         usable.evaluate.return_value = "interactive"
         navigate(usable, "https://m365.cloud.microsoft/chat")
+
+    def test_account_selector_is_not_mistaken_for_required_visible_login(self) -> None:
+        self.assertFalse(
+            explicit_authentication_required(
+                "https://login.microsoftonline.com/tenant/oauth2/v2.0/authorize",
+                "Pick an account anas.nmili@mazars.fr",
+            )
+        )
+        self.assertTrue(
+            explicit_authentication_required(
+                "https://login.microsoftonline.com/tenant/oauth2/v2.0/authorize",
+                "Approve sign in request in Microsoft Authenticator",
+            )
+        )
 
     def test_expired_spa_refresh_token_requires_real_sign_in(self) -> None:
         self.assertTrue(

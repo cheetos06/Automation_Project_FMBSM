@@ -230,6 +230,21 @@ def looks_like_login_or_blocked(page: Page) -> bool:
     )
 
 
+def explicit_authentication_required(current_url: str, page_text: str) -> bool:
+    """Return true only when Microsoft explicitly asks for user credentials/MFA."""
+    interaction_markers = (
+        "error=interaction_required",
+        "error=login_required",
+        "aadsts50058",
+        "enter password",
+        "approve sign in request",
+        "verify your identity",
+        "more information required",
+    )
+    combined = f"{current_url}\n{page_text}".lower()
+    return any(marker in combined for marker in interaction_markers)
+
+
 def start_new_chat_if_possible(page: Page) -> bool:
     button = first_visible(
         page,
@@ -809,6 +824,7 @@ def renew_microsoft_session(
                 + urllib.parse.urlencode(authorize_parameters)
             )
             navigate(page, authorize_url)
+            authorization_started = time.monotonic()
             if progress is not None and not headless:
                 if mode == "select_account":
                     progress(f"Select {expected_username} in Edge and complete sign-in/MFA...")
@@ -843,6 +859,7 @@ def renew_microsoft_session(
                     return result
 
                 elapsed = time.monotonic() - started
+                auth_elapsed = time.monotonic() - authorization_started
                 current_url = str(state.get("href") or page.url).lower()
                 if not opened_m365_after_authorize and "/landingv2" in current_url:
                     opened_m365_after_authorize = True
@@ -850,31 +867,18 @@ def renew_microsoft_session(
                         progress("Microsoft authorization returned successfully; opening M365 to create its fresh token cache...")
                     navigate(page, site)
                     continue
-                if elapsed >= 3 and elapsed - last_auto_action >= 1.5 and auto_action_count < 8:
+                if auth_elapsed >= 3 and auth_elapsed - last_auto_action >= 1.5 and auto_action_count < 8:
                     action = _automatic_reauth_step(page, expected_username)
                     if action:
                         auto_action_count += 1
-                        last_auto_action = elapsed
+                        last_auto_action = auth_elapsed
                         if progress is not None:
                             progress(f"Microsoft sign-in step: {action}.")
-                if headless and elapsed >= 8:
+                if headless and auth_elapsed >= 8:
                     page_text = visible_text(page).lower()
-                    interaction_markers = (
-                        "error=interaction_required",
-                        "error=login_required",
-                        "aadsts50058",
-                        "enter password",
-                        "approve sign in request",
-                        "verify your identity",
-                        "more information required",
-                    )
-                    if any(marker in current_url or marker in page_text for marker in interaction_markers):
+                    if explicit_authentication_required(current_url, page_text):
                         raise InteractiveAuthenticationRequired(
                             f"Microsoft requires visible sign-in or MFA for {expected_username}"
-                        )
-                    if elapsed >= 15 and "login.microsoftonline.com" in current_url:
-                        raise InteractiveAuthenticationRequired(
-                            f"Microsoft is still waiting for visible sign-in for {expected_username}"
                         )
                 if progress is not None and elapsed - last_progress >= 10:
                     location = urllib.parse.urlsplit(str(state.get("href") or page.url))
@@ -884,7 +888,7 @@ def renew_microsoft_session(
                         f"MSAL records={state.get('recordCount', 0)})..."
                     )
                     last_progress = elapsed
-                if not headless and prompt_user and not prompted and elapsed >= 4:
+                if not headless and prompt_user and not prompted and auth_elapsed >= 4:
                     prompted = True
                     _pause(
                         f"Microsoft requires a new sign-in for {expected_username}.\n\n"
