@@ -284,6 +284,86 @@ class ClientBundleTests(unittest.TestCase):
             self.assertEqual(app.automation_state.pending_work_refresh_slot, "")
             self.assertEqual(app.automation_state.last_work_refresh_result, "success:1")
 
+    def test_scheduler_stops_after_two_delayed_network_retries(self) -> None:
+        now = datetime.now().astimezone()
+        due_time = now.strftime("%H:%M")
+        account = ClientAccount(
+            account_id="account-test",
+            username="tester@mazars.fr",
+            tenant_id="tenant",
+            object_id="object",
+            session_dir="session",
+            profile_dir="profile",
+            access_expires_at=now.timestamp() + 3600,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            app = TokenPoolApp.__new__(TokenPoolApp)
+            app.shutting_down = False
+            app.refresh_times = (due_time,)
+            app.store = MagicMock()
+            app.store.load.return_value = [account]
+            app.automation_state = AutomationState(path=Path(temporary) / "automation-state.json")
+            app.busy = False
+            app.next_update_check = float("inf")
+            app.root = MagicMock()
+            app.tray = MagicMock()
+            app.log = MagicMock()
+            app._renew_and_upload = MagicMock()
+            attempts = 0
+
+            def run_background(label, work, *, on_complete, show_error):
+                nonlocal attempts
+                attempts += 1
+                on_complete(RenewalBatchResult(transient_failures=1), None)
+                return True
+
+            app._background = run_background
+            for _ in range(3):
+                app._scheduler_tick()
+                app.automation_state.next_work_retry_at = (now - timedelta(seconds=1)).isoformat()
+
+            self.assertEqual(attempts, 3)
+            self.assertTrue(app.automation_state.last_work_refresh_slot)
+            self.assertEqual(app.automation_state.pending_work_refresh_slot, "")
+            self.assertEqual(app.automation_state.work_retry_count, 2)
+            self.assertEqual(app.automation_state.last_work_refresh_result, "network_retry_exhausted:2")
+            app._scheduler_tick()
+            self.assertEqual(attempts, 3)
+
+    def test_scheduler_does_not_resurrect_legacy_failed_slot(self) -> None:
+        now = datetime.now().astimezone()
+        due_time = now.strftime("%H:%M")
+        due = latest_due_slot(now, (due_time,))
+        self.assertIsNotNone(due)
+        account = ClientAccount(
+            account_id="account-test",
+            username="tester@mazars.fr",
+            tenant_id="tenant",
+            object_id="object",
+            session_dir="session",
+            profile_dir="profile",
+            access_expires_at=now.timestamp() - 60,
+            last_error="[WinError 10060] failed to respond",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            app = TokenPoolApp.__new__(TokenPoolApp)
+            app.shutting_down = False
+            app.refresh_times = (due_time,)
+            app.store = MagicMock()
+            app.store.load.return_value = [account]
+            app.automation_state = AutomationState(
+                path=Path(temporary) / "automation-state.json",
+                last_work_refresh_slot=slot_key(due),
+                last_work_refresh_result="failed:1",
+            )
+            app.busy = False
+            app.next_update_check = float("inf")
+            app.root = MagicMock()
+            app._background = MagicMock()
+            app._scheduler_tick()
+            app._background.assert_not_called()
+            self.assertEqual(app.automation_state.pending_work_refresh_slot, "")
+
     def test_one_hour_access_expiry_does_not_mean_authorization_expiry(self) -> None:
         now = datetime(2026, 7, 16, 10, 0, tzinfo=UTC).timestamp()
         account = ClientAccount(

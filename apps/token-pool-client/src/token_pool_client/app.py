@@ -45,6 +45,7 @@ from .upload import (
 SAMPLE_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAV0lEQVR4nO3PQQ0AIBDAsAP/nuGNAvZoFSzZOjNnyNi1dwfgUQFeFeBVAV4V4FUBXhXgVQFeFeBVAV4V4FUBXhXgVQFeFeBVAV4V4FUBXhXgVQFeFeBVAV4V4FUB3gA5ggJ/QlTzGAAAAABJRU5ErkJggg=="
 )
+MAX_SCHEDULED_NETWORK_RETRIES = 2
 
 
 @dataclass(frozen=True)
@@ -552,15 +553,6 @@ class TokenPoolApp:
         if due is not None:
             key = slot_key(due)
             accounts = [item for item in self.store.load() if is_automatic_work_account(item.username)]
-            legacy_network_failure = (
-                key == self.automation_state.last_work_refresh_slot
-                and self.automation_state.last_work_refresh_result.startswith("failed")
-                and any(item.last_error and _is_transient_failure(RuntimeError(item.last_error)) for item in accounts)
-            )
-            if legacy_network_failure and not self.automation_state.pending_work_refresh_slot:
-                self.automation_state.pending_work_refresh_slot = key
-                self.automation_state.next_work_retry_at = ""
-
             pending_this_slot = self.automation_state.pending_work_refresh_slot == key
             retry_due = pending_this_slot and _retry_is_due(self.automation_state.next_work_retry_at, now)
             new_slot = key != self.automation_state.last_work_refresh_slot and not pending_this_slot
@@ -581,17 +573,33 @@ class TokenPoolApp:
                         failure is not None and _is_transient_failure(failure)
                     )
                     if transient:
-                        self.automation_state.pending_work_refresh_slot = key
-                        self.automation_state.work_retry_count += 1
-                        retry_seconds = _network_retry_seconds(self.automation_state.work_retry_count)
-                        retry_at = datetime.now().astimezone() + timedelta(seconds=retry_seconds)
-                        self.automation_state.next_work_retry_at = retry_at.isoformat(timespec="seconds")
-                        self.automation_state.last_work_refresh_result = (
-                            f"waiting_for_network:{self.automation_state.work_retry_count}"
-                        )
-                        self.log(f"Scheduled renewal will retry at {retry_at.strftime('%H:%M:%S')}.")
-                        if self.automation_state.work_retry_count == 1:
-                            self._notify_renewal_result(batch, failure=failure)
+                        if self.automation_state.work_retry_count >= MAX_SCHEDULED_NETWORK_RETRIES:
+                            self.automation_state.last_work_refresh_slot = key
+                            self.automation_state.pending_work_refresh_slot = ""
+                            self.automation_state.next_work_retry_at = ""
+                            self.automation_state.last_work_refresh_result = (
+                                f"network_retry_exhausted:{self.automation_state.work_retry_count}"
+                            )
+                            self.log(
+                                "Scheduled renewal stopped after two network retries; "
+                                "the next scheduled slot or a manual refresh can try again."
+                            )
+                            self.tray.notify(
+                                "FMBSM automatic retries stopped",
+                                "Network upload failed after two retries. Retry manually later if needed.",
+                            )
+                        else:
+                            self.automation_state.pending_work_refresh_slot = key
+                            self.automation_state.work_retry_count += 1
+                            retry_seconds = _network_retry_seconds(self.automation_state.work_retry_count)
+                            retry_at = datetime.now().astimezone() + timedelta(seconds=retry_seconds)
+                            self.automation_state.next_work_retry_at = retry_at.isoformat(timespec="seconds")
+                            self.automation_state.last_work_refresh_result = (
+                                f"waiting_for_network:{self.automation_state.work_retry_count}"
+                            )
+                            self.log(f"Scheduled renewal will retry at {retry_at.strftime('%H:%M:%S')}.")
+                            if self.automation_state.work_retry_count == 1:
+                                self._notify_renewal_result(batch, failure=failure)
                     else:
                         self.automation_state.last_work_refresh_slot = key
                         self.automation_state.pending_work_refresh_slot = ""
