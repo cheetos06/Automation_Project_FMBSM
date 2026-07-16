@@ -31,9 +31,10 @@ def create_bundle(account: ClientAccount) -> bytes:
         if path.exists():
             selections.append(path)
     manifest = {
-        "version": 1,
+        "version": 2,
         "client_version": __version__,
         "created_at": time.time(),
+        "authorization_expires_at": account.authorization_expires_at,
         "claimed_account_id": account.account_id,
         "claimed_username": account.username,
         "claimed_tenant_id": account.tenant_id,

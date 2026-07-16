@@ -134,6 +134,9 @@ class AutomationState:
     path: Path
     last_work_refresh_slot: str = ""
     last_work_refresh_result: str = ""
+    pending_work_refresh_slot: str = ""
+    next_work_retry_at: str = ""
+    work_retry_count: int = 0
     last_update_check_at: str = ""
 
     @classmethod
@@ -147,20 +150,33 @@ class AutomationState:
             path=path,
             last_work_refresh_slot=str(payload.get("last_work_refresh_slot") or ""),
             last_work_refresh_result=str(payload.get("last_work_refresh_result") or ""),
+            pending_work_refresh_slot=str(payload.get("pending_work_refresh_slot") or ""),
+            next_work_retry_at=str(payload.get("next_work_retry_at") or ""),
+            work_retry_count=_nonnegative_int(payload.get("work_retry_count")),
             last_update_check_at=str(payload.get("last_update_check_at") or ""),
         )
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": 1,
+            "version": 2,
             "last_work_refresh_slot": self.last_work_refresh_slot,
             "last_work_refresh_result": self.last_work_refresh_result,
+            "pending_work_refresh_slot": self.pending_work_refresh_slot,
+            "next_work_retry_at": self.next_work_retry_at,
+            "work_retry_count": self.work_retry_count,
             "last_update_check_at": self.last_update_check_at,
         }
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temporary.replace(self.path)
+
+
+def _nonnegative_int(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def register_startup(root: Path | None = None) -> bool:

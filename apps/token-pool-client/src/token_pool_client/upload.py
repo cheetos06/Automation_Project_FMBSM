@@ -26,6 +26,40 @@ class ClientConfig:
     github_repository: str
 
 
+class TransientNetworkError(RuntimeError):
+    """A temporary internet/AWS failure that should be retried without blaming the token."""
+
+
+_TRANSIENT_MARKERS = (
+    "err_internet_disconnected",
+    "err_name_not_resolved",
+    "err_network_changed",
+    "err_connection_timed_out",
+    "err_connection_reset",
+    "err_connection_closed",
+    "timed out",
+    "timeout",
+    "temporary failure",
+    "network is unreachable",
+    "internet connection is not ready",
+    "microsoft page did not finish loading",
+    "winerror 10060",
+    "getaddrinfo failed",
+    "remote name could not be resolved",
+    "failed to respond",
+    "unable to connect",
+    "cannot reach the token server",
+    "token service is temporarily unavailable",
+)
+
+
+def is_transient_network_error(error: BaseException) -> bool:
+    if isinstance(error, TransientNetworkError):
+        return True
+    message = str(error).lower()
+    return any(marker in message for marker in _TRANSIENT_MARKERS)
+
+
 def load_config() -> ClientConfig:
     explicit = os.getenv("TOKEN_POOL_CLIENT_CONFIG", "").strip()
     candidates = [
@@ -52,26 +86,40 @@ def load_config() -> ClientConfig:
 
 def upload_bundle(config: ClientConfig, bundle: bytes) -> dict[str, Any]:
     payload = encrypt_bundle(bundle, config.ca_certificate)
-    request = urllib.request.Request(
-        config.endpoint + "/v1/accounts/session",
-        data=payload,
-        headers={
-            "Content-Type": ENVELOPE_CONTENT_TYPE,
-            "User-Agent": "FMBSM-Token-Pool-Client/1",
-        },
-        method="POST",
+    return _request_with_retry(
+        lambda: _sign(
+            urllib.request.Request(
+                config.endpoint + "/v1/accounts/session",
+                data=payload,
+                headers={
+                    "Content-Type": ENVELOPE_CONTENT_TYPE,
+                    "User-Agent": "FMBSM-Token-Pool-Client/1",
+                },
+                method="POST",
+            ),
+            config.upload_key,
+            payload,
+        ),
+        config,
+        timeout_seconds=10,
+        attempts=2,
     )
-    return _open_json(_sign(request, config.upload_key, payload), config)
 
 
 def server_status(config: ClientConfig) -> dict[str, Any]:
-    request = urllib.request.Request(
-        config.endpoint + "/v1/status",
-        headers={
-            "User-Agent": "FMBSM-Token-Pool-Client/1",
-        },
+    return _request_with_retry(
+        lambda: _sign(
+            urllib.request.Request(
+                config.endpoint + "/v1/status",
+                headers={"User-Agent": "FMBSM-Token-Pool-Client/1"},
+            ),
+            config.upload_key,
+            b"",
+        ),
+        config,
+        timeout_seconds=4,
+        attempts=2,
     )
-    return _open_json(_sign(request, config.upload_key, b""), config)
 
 
 def _sign(request: urllib.request.Request, key: str, body: bytes) -> urllib.request.Request:
@@ -88,20 +136,52 @@ def _sign(request: urllib.request.Request, key: str, body: bytes) -> urllib.requ
     return request
 
 
-def _open_json(request: urllib.request.Request, config: ClientConfig) -> dict[str, Any]:
+def _request_with_retry(
+    request_factory,
+    config: ClientConfig,
+    *,
+    timeout_seconds: float,
+    attempts: int = 3,
+) -> dict[str, Any]:
+    last_error: TransientNetworkError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _open_json(request_factory(), config, timeout_seconds=timeout_seconds)
+        except TransientNetworkError as exc:
+            last_error = exc
+            if attempt == attempts:
+                break
+            time.sleep(attempt)
+    raise last_error or TransientNetworkError(
+        "The internet or AWS token service is temporarily unavailable. The app will retry automatically."
+    )
+
+
+def _open_json(
+    request: urllib.request.Request,
+    config: ClientConfig,
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any]:
     handlers: list[urllib.request.BaseHandler] = []
     if urllib.parse.urlsplit(config.endpoint).scheme.lower() == "https":
         context = ssl.create_default_context(cafile=str(config.ca_certificate))
         handlers.append(urllib.request.HTTPSHandler(context=context))
     opener = urllib.request.build_opener(*handlers)
     try:
-        with opener.open(request, timeout=90) as response:
+        with opener.open(request, timeout=timeout_seconds) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
+        if exc.code >= 500:
+            raise TransientNetworkError(
+                "The AWS token service is temporarily unavailable. The app will retry automatically."
+            ) from exc
         try:
             detail = json.loads(exc.read().decode("utf-8"))
         except Exception:
             detail = {"error": str(exc)}
         raise RuntimeError(f"Server rejected the request: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Cannot reach the token server: {exc.reason}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise TransientNetworkError(
+            "The internet or AWS token service is temporarily unavailable. The app will retry automatically."
+        ) from exc

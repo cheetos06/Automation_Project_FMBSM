@@ -28,6 +28,47 @@ class InteractiveAuthenticationRequired(RuntimeError):
     """A fresh Microsoft authorization could not finish without user interaction."""
 
 
+class BrowserConnectivityError(RuntimeError):
+    """Microsoft pages could not be reached because the computer is offline."""
+
+
+def navigate(page: Page, url: str, *, timeout_ms: int = 30000) -> None:
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    except TimeoutError as exc:
+        # Microsoft pages can keep background requests open after the useful DOM
+        # is ready. A Playwright timeout alone is therefore not proof of failure.
+        try:
+            if page.evaluate("document.readyState") in {"interactive", "complete"}:
+                return
+        except Exception:
+            pass
+        raise BrowserConnectivityError(
+            "The Microsoft page did not finish loading. The app will retry automatically."
+        ) from exc
+    except PlaywrightError as exc:
+        message = str(exc).lower()
+        if any(
+            marker in message
+            for marker in (
+                "net::err_internet_disconnected",
+                "net::err_name_not_resolved",
+                "net::err_network_changed",
+                "net::err_connection_timed_out",
+                "net::err_connection_reset",
+                "net::err_connection_closed",
+                "net::err_connection_refused",
+                "net::err_address_unreachable",
+                "net::err_proxy_connection_failed",
+                "net::err_tunnel_connection_failed",
+            )
+        ):
+            raise BrowserConnectivityError(
+                "The internet connection is not ready yet. The app will retry automatically."
+            ) from exc
+        raise
+
+
 def set_interaction_callback(callback: Callable[[str], None] | None) -> None:
     global _INTERACTION_CALLBACK
     _INTERACTION_CALLBACK = callback
@@ -210,6 +251,23 @@ def start_new_chat_if_possible(page: Page) -> bool:
         return False
 
 
+def ensure_new_chat(page: Page, *, interactive: bool = True) -> str:
+    """Start bootstrap from a blank chat and never probe an existing conversation."""
+    if start_new_chat_if_possible(page):
+        if prompt_box(page) is None:
+            raise RuntimeError("A blank Copilot chat opened, but its message box was not detected.")
+        return "new-chat button"
+    if not interactive:
+        raise RuntimeError("Could not safely open a new Copilot conversation.")
+    print("\nI could not safely locate Copilot's New chat control.")
+    print("In the browser window, open a blank New chat. Do not select an existing conversation.")
+    _pause("Open a blank New chat in Copilot, then continue in the Token Pool Client.")
+    wait_for_page_settle(page, timeout_ms=5000)
+    if looks_like_login_or_blocked(page) or prompt_box(page) is None:
+        raise RuntimeError("A blank Copilot chat was not detected.")
+    return "manual new chat"
+
+
 def wait_for_file_input(page: Page, timeout_ms: int = 10000) -> Locator | None:
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
@@ -262,12 +320,9 @@ def upload_image_or_pause(page: Page, image_path: Path, *, interactive: bool = T
     else:
         print("Upload: hidden file input unavailable, trying file chooser.")
 
-    button_names = re.compile(
-        r"(attach|attachment|upload|image|file|paperclip|joindre|"
-        r"device|charger|televerser|téléverser)",
-        re.IGNORECASE,
-    )
-    button_selectors = [
+    # Choose at most one explicit upload control. Broad role/name probing used
+    # to click unrelated controls when Copilot restored an existing chat.
+    upload_button = first_visible(page, [
         '[role="menuitem"]:has-text("Upload images and files")',
         '[role="menuitem"]:has-text("Upload")',
         '[role="menuitem"]:has-text("images and files")',
@@ -279,30 +334,16 @@ def upload_image_or_pause(page: Page, image_path: Path, *, interactive: bool = T
         'button[title*="Upload" i]',
         'button[title*="device" i]',
         'button[title*="Image" i]',
-    ]
-    candidates: list[Locator] = []
-    for role in ("button", "menuitem"):
-        locator = page.get_by_role(role, name=button_names)
-        try:
-            count = min(locator.count(), 20)
-        except Exception:
-            count = 0
-        for index in range(count):
-            candidates.append(locator.nth(index))
-    for selector in button_selectors:
-        item = first_visible(page, [selector])
-        if item is not None:
-            candidates.append(item)
-
-    for candidate in candidates:
+    ])
+    if upload_button is not None:
         try:
             with page.expect_file_chooser(timeout=3000) as chooser_info:
-                candidate.click(timeout=3000)
+                upload_button.click(timeout=3000)
             chooser_info.value.set_files(str(image_path))
             page.wait_for_timeout(8000)
             return "filechooser"
         except Exception:
-            continue
+            pass
 
     if not interactive:
         raise RuntimeError("Could not find an upload control for the image.")
@@ -726,10 +767,7 @@ def renew_microsoft_session(
             if progress is not None:
                 progress("Edge opened; loading Microsoft 365...")
             page = context.pages[0] if context.pages else context.new_page()
-            try:
-                page.goto(site, wait_until="domcontentloaded", timeout=30000)
-            except TimeoutError:
-                pass
+            navigate(page, site)
             wait_for_page_settle(page, timeout_ms=10000)
 
             # A refresh-token grant cannot extend a SPA token's fixed 24-hour
@@ -770,10 +808,7 @@ def renew_microsoft_session(
                 f"https://login.microsoftonline.com/{expected_tenant or 'organizations'}/oauth2/v2.0/authorize?"
                 + urllib.parse.urlencode(authorize_parameters)
             )
-            try:
-                page.goto(authorize_url, wait_until="domcontentloaded", timeout=30000)
-            except TimeoutError:
-                pass
+            navigate(page, authorize_url)
             if progress is not None and not headless:
                 if mode == "select_account":
                     progress(f"Select {expected_username} in Edge and complete sign-in/MFA...")
@@ -813,10 +848,7 @@ def renew_microsoft_session(
                     opened_m365_after_authorize = True
                     if progress is not None:
                         progress("Microsoft authorization returned successfully; opening M365 to create its fresh token cache...")
-                    try:
-                        page.goto(site, wait_until="domcontentloaded", timeout=30000)
-                    except TimeoutError:
-                        pass
+                    navigate(page, site)
                     continue
                 if elapsed >= 3 and elapsed - last_auto_action >= 1.5 and auto_action_count < 8:
                     action = _automatic_reauth_step(page, expected_username)
@@ -917,10 +949,8 @@ def bootstrap_api_session(
         try:
             page = context.pages[0] if context.pages else context.new_page()
             capture.attach(page)
-            page.goto(site, wait_until="domcontentloaded")
+            navigate(page, site)
             wait_for_page_settle(page)
-            if start_new_chat_if_possible(page):
-                wait_for_page_settle(page, timeout_ms=5000)
 
             if looks_like_login_or_blocked(page) or prompt_box(page) is None:
                 print("\nSign in or finish MFA in the browser window. Stop when the Copilot message box is visible.")
@@ -929,6 +959,7 @@ def bootstrap_api_session(
             if looks_like_login_or_blocked(page) or prompt_box(page) is None:
                 raise RuntimeError("Copilot chat input was not detected after login.")
 
+            new_chat_method = ensure_new_chat(page, interactive=True)
             upload_method = upload_image_or_pause(page, image_path, interactive=True)
             prompt_method = fill_prompt_or_pause(page, prompt, interactive=True)
             submit_method = submit_prompt_or_pause(page, interactive=True)
@@ -948,6 +979,7 @@ def bootstrap_api_session(
                     "image_path": str(image_path),
                     "site": site,
                     "profile_dir": str(profile_dir),
+                    "new_chat_method": new_chat_method,
                     "upload_method": upload_method,
                     "prompt_method": prompt_method,
                     "submit_method": submit_method,
@@ -1016,7 +1048,7 @@ def main() -> int:
     with sync_playwright() as playwright:
         context = launch_context(playwright, profile_dir, channel=args.channel, headless=False)
         page = context.pages[0] if context.pages else context.new_page()
-        page.goto(site, wait_until="domcontentloaded")
+        navigate(page, site)
         wait_for_page_settle(page)
         print("\nCopilot Runtime browser profile:")
         print(f"  {profile_dir}")

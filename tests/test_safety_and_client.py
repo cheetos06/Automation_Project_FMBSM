@@ -9,11 +9,13 @@ import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,10 +30,24 @@ from fmbsm_email_bot.worker import _is_authorized_job_sender  # noqa: E402
 from fmbsm_email_bot.zip_utils import safe_extract_files  # noqa: E402
 from token_pool_client.bundle import create_bundle  # noqa: E402
 from token_pool_client.automation import (  # noqa: E402
+    AutomationState,
     configured_refresh_times,
     is_automatic_work_account,
     latest_due_slot,
     slot_key,
+)
+from token_pool_client.app import (  # noqa: E402
+    RenewalBatchResult,
+    TokenPoolApp,
+    _account_status,
+    _authorization_expires_at,
+    _retry_is_due,
+    _server_account_state,
+)
+from token_pool_client.bootstrap import (  # noqa: E402
+    BrowserConnectivityError,
+    navigate,
+    upload_image_or_pause,
 )
 from token_pool_client.refresh import (  # noqa: E402
     RefreshError,
@@ -40,6 +56,12 @@ from token_pool_client.refresh import (  # noqa: E402
 )
 from token_pool_client.storage import ClientAccount  # noqa: E402
 from token_pool_client.transport_crypto import encrypt_bundle  # noqa: E402
+from token_pool_client.upload import (  # noqa: E402
+    ClientConfig,
+    TransientNetworkError,
+    _request_with_retry,
+    is_transient_network_error,
+)
 from copilot_service.transport_crypto import EnvelopeError, decrypt_envelope, load_private_key  # noqa: E402
 from copilot_service.microsoft_oauth import CLIENT_ID, OAuthRefreshRejected  # noqa: E402
 from copilot_service.session_bundle import BundleValidationError  # noqa: E402
@@ -191,6 +213,207 @@ class ClientBundleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             configured_refresh_times("25:00")
 
+    def test_automation_state_persists_pending_network_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = AutomationState(
+                path=root / "automation-state.json",
+                last_work_refresh_result="waiting_for_network:2",
+                pending_work_refresh_slot="2026-07-16T09:45+01:00",
+                next_work_retry_at="2026-07-16T10:00:00+01:00",
+                work_retry_count=2,
+            )
+            state.save()
+            loaded = AutomationState.load(root)
+            self.assertEqual(loaded.pending_work_refresh_slot, state.pending_work_refresh_slot)
+            self.assertEqual(loaded.next_work_retry_at, state.next_work_retry_at)
+            self.assertEqual(loaded.work_retry_count, 2)
+            self.assertFalse(
+                _retry_is_due(
+                    loaded.next_work_retry_at,
+                    datetime.fromisoformat("2026-07-16T09:55:00+01:00"),
+                )
+            )
+
+    def test_scheduler_retries_offline_slot_then_marks_only_success_complete(self) -> None:
+        now = datetime.now().astimezone()
+        due_time = now.strftime("%H:%M")
+        account = ClientAccount(
+            account_id="account-test",
+            username="tester@mazars.fr",
+            tenant_id="tenant",
+            object_id="object",
+            session_dir="session",
+            profile_dir="profile",
+            access_expires_at=now.timestamp() + 3600,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            app = TokenPoolApp.__new__(TokenPoolApp)
+            app.shutting_down = False
+            app.refresh_times = (due_time,)
+            app.store = MagicMock()
+            app.store.load.return_value = [account]
+            app.automation_state = AutomationState(path=Path(temporary) / "automation-state.json")
+            app.busy = False
+            app.next_update_check = float("inf")
+            app.root = MagicMock()
+            app.tray = MagicMock()
+            app.log = MagicMock()
+            app._renew_and_upload = MagicMock()
+            results = iter(
+                [
+                    RenewalBatchResult(transient_failures=1),
+                    RenewalBatchResult(successes=1),
+                ]
+            )
+
+            def run_background(label, work, *, on_complete, show_error):
+                on_complete(next(results), None)
+                return True
+
+            app._background = run_background
+            app._scheduler_tick()
+            pending_slot = app.automation_state.pending_work_refresh_slot
+            self.assertTrue(pending_slot)
+            self.assertEqual(app.automation_state.last_work_refresh_slot, "")
+            self.assertEqual(app.automation_state.last_work_refresh_result, "waiting_for_network:1")
+
+            app.automation_state.next_work_retry_at = (now - timedelta(seconds=1)).isoformat()
+            app._scheduler_tick()
+            self.assertEqual(app.automation_state.last_work_refresh_slot, pending_slot)
+            self.assertEqual(app.automation_state.pending_work_refresh_slot, "")
+            self.assertEqual(app.automation_state.last_work_refresh_result, "success:1")
+
+    def test_one_hour_access_expiry_does_not_mean_authorization_expiry(self) -> None:
+        now = datetime(2026, 7, 16, 10, 0, tzinfo=UTC).timestamp()
+        account = ClientAccount(
+            account_id="account-test",
+            username="tester@mazars.fr",
+            tenant_id="tenant",
+            object_id="object",
+            session_dir="session",
+            profile_dir="profile",
+            access_expires_at=now - 60,
+            authorization_expires_at=now + 20 * 60 * 60,
+        )
+        self.assertEqual(_account_status(account, now=now), "Ready")
+        self.assertEqual(_authorization_expires_at(account), now + 20 * 60 * 60)
+        self.assertEqual(
+            _server_account_state(
+                {
+                    "enabled": True,
+                    "access_valid": False,
+                    "refresh_expires_at": None,
+                    "cooling_down": False,
+                },
+                now=now,
+            ),
+            "ready",
+        )
+
+    def test_transient_connectivity_is_friendly_and_retried_with_new_request(self) -> None:
+        self.assertTrue(is_transient_network_error(OSError("[WinError 10060] failed to respond")))
+        config = ClientConfig("http://example.invalid", "key", Path("unused"), "repo")
+        requests: list[object] = []
+
+        def request_factory() -> object:
+            request = object()
+            requests.append(request)
+            return request
+
+        with patch(
+            "token_pool_client.upload._open_json",
+            side_effect=[TransientNetworkError("offline"), {"ok": True}],
+        ) as open_json:
+            with patch("token_pool_client.upload.time.sleep"):
+                self.assertEqual(
+                    _request_with_retry(request_factory, config, timeout_seconds=1, attempts=2),
+                    {"ok": True},
+                )
+        self.assertEqual(len(requests), 2)
+        self.assertIsNot(requests[0], requests[1])
+        self.assertEqual(open_json.call_count, 2)
+
+    def test_offline_preflight_does_not_open_microsoft_and_remains_pending(self) -> None:
+        account = ClientAccount(
+            account_id="account-test",
+            username="tester@mazars.fr",
+            tenant_id="tenant",
+            object_id="object",
+            session_dir="session",
+            profile_dir="profile",
+            access_expires_at=9999999999,
+        )
+        app = TokenPoolApp.__new__(TokenPoolApp)
+        app.config = ClientConfig("http://example.invalid", "key", Path("unused"), "repo")
+        app.store = MagicMock()
+        app.log = MagicMock()
+        app._fresh_renewal = MagicMock()
+        with patch(
+            "token_pool_client.app.server_status",
+            side_effect=TransientNetworkError("offline"),
+        ):
+            result = app._renew_and_upload([account], automatic=True)
+        self.assertTrue(result.waiting_for_network)
+        self.assertEqual(result.transient_failures, 1)
+        app._fresh_renewal.assert_not_called()
+
+    def test_network_failure_after_renewal_preserves_pending_upload_without_token_error(self) -> None:
+        account = ClientAccount(
+            account_id="account-test",
+            username="tester@mazars.fr",
+            tenant_id="tenant",
+            object_id="object",
+            session_dir="session",
+            profile_dir="profile",
+            access_expires_at=9999999999,
+            authorization_expires_at=9999999999,
+        )
+        app = TokenPoolApp.__new__(TokenPoolApp)
+        app.config = ClientConfig("http://example.invalid", "key", Path("unused"), "repo")
+        app.store = MagicMock()
+        app.log = MagicMock()
+        app._fresh_renewal = MagicMock(return_value=account)
+        with patch("token_pool_client.app.server_status", return_value={"pool": {}}), patch(
+            "token_pool_client.app.create_bundle", return_value=b"bundle"
+        ), patch(
+            "token_pool_client.app.upload_bundle",
+            side_effect=TransientNetworkError("offline"),
+        ):
+            result = app._renew_and_upload([account], automatic=True)
+        self.assertTrue(result.waiting_for_network)
+        self.assertTrue(account.pending_upload)
+        self.assertIsNone(account.last_error)
+        self.assertGreaterEqual(app.store.upsert.call_count, 1)
+
+    def test_bootstrap_upload_clicks_only_one_explicit_control(self) -> None:
+        page = MagicMock()
+        button = MagicMock()
+        chooser = MagicMock()
+        chooser.value = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = chooser
+        page.expect_file_chooser.return_value = context
+        with patch("token_pool_client.bootstrap.click_sources_menu_if_present", return_value=True), patch(
+            "token_pool_client.bootstrap.wait_for_file_input", return_value=None
+        ), patch("token_pool_client.bootstrap.first_visible", return_value=button):
+            method = upload_image_or_pause(page, Path("bootstrap.png"), interactive=False)
+        self.assertEqual(method, "filechooser")
+        button.click.assert_called_once()
+        page.get_by_role.assert_not_called()
+
+    def test_navigation_timeout_requires_a_usable_microsoft_dom(self) -> None:
+        stalled = MagicMock()
+        stalled.goto.side_effect = PlaywrightTimeoutError("timed out")
+        stalled.evaluate.return_value = "loading"
+        with self.assertRaises(BrowserConnectivityError):
+            navigate(stalled, "https://m365.cloud.microsoft/chat")
+
+        usable = MagicMock()
+        usable.goto.side_effect = PlaywrightTimeoutError("timed out")
+        usable.evaluate.return_value = "interactive"
+        navigate(usable, "https://m365.cloud.microsoft/chat")
+
     def test_expired_spa_refresh_token_requires_real_sign_in(self) -> None:
         self.assertTrue(
             requires_interactive_reauthentication(
@@ -297,7 +520,9 @@ class ClientBundleTests(unittest.TestCase):
             bundle_path.write_bytes(create_bundle(account))
             with zipfile.ZipFile(bundle_path) as archive:
                 names = set(archive.namelist())
+                manifest = json.loads(archive.read("manifest.json"))
             self.assertIn("manifest.json", names)
+            self.assertEqual(manifest["version"], 2)
             self.assertEqual(names - {"manifest.json"}, set(required))
             self.assertNotIn("browser-secret.txt", names)
 

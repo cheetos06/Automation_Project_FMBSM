@@ -19,6 +19,7 @@ from .storage import ClientAccount
 
 CLIENT_ID = "4765445b-32c6-49b0-83e6-1d93765276ca"
 SCOPE = "https://substrate.office.com/sydney/.default openid profile offline_access"
+SPA_AUTHORIZATION_LIFETIME_SECONDS = 24 * 60 * 60
 
 
 class RefreshError(RuntimeError):
@@ -80,7 +81,12 @@ def refresh_existing(account: ClientAccount) -> tuple[ClientAccount, dict[str, A
     combined.update(refreshed)
     if not refreshed.get("refresh_token"):
         combined["refresh_token"] = refresh_token
-    updated = _save_and_patch(account.session_path, account.profile_path, combined)
+    updated = _save_and_patch(
+        account.session_path,
+        account.profile_path,
+        combined,
+        authorization_expires_at=account.authorization_expires_at,
+    )
     updated.last_uploaded_at = account.last_uploaded_at
     return updated, combined
 
@@ -110,7 +116,13 @@ def initialize_refresh(
         refreshed["refresh_token"] = original_refresh_token
     if expected_account is not None:
         _validate_expected_identity(refreshed, expected_account)
-    account = _save_and_patch(session_dir, profile_dir, refreshed)
+    authorization_at = _record_updated_at(selected) or time.time()
+    account = _save_and_patch(
+        session_dir,
+        profile_dir,
+        refreshed,
+        authorization_expires_at=authorization_at + SPA_AUTHORIZATION_LIFETIME_SECONDS,
+    )
     return account, refreshed
 
 
@@ -249,7 +261,13 @@ def decrypt_captured_msal(session_dir: Path) -> list[dict[str, Any]]:
     return records
 
 
-def _save_and_patch(session_dir: Path, profile_dir: Path, payload: dict[str, Any]) -> ClientAccount:
+def _save_and_patch(
+    session_dir: Path,
+    profile_dir: Path,
+    payload: dict[str, Any],
+    *,
+    authorization_expires_at: float | None = None,
+) -> ClientAccount:
     access_token = str(payload.get("access_token") or "")
     claims = decode_claims(access_token)
     expires_at = float(claims.get("exp") or 0)
@@ -269,7 +287,19 @@ def _save_and_patch(session_dir: Path, profile_dir: Path, payload: dict[str, Any
         session_dir=str(session_dir.resolve()),
         profile_dir=str(profile_dir.resolve()),
         access_expires_at=expires_at,
+        authorization_expires_at=authorization_expires_at,
     )
+
+
+def _record_updated_at(record: dict[str, Any]) -> float | None:
+    raw = record.get("value", {}).get("lastUpdatedAt") or record.get("lastUpdatedAt")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value > 10_000_000_000:
+        value /= 1000
+    return value if value > 0 else None
 
 
 def _patch_session(session_dir: Path, access_token: str) -> None:

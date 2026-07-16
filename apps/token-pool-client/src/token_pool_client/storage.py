@@ -33,6 +33,8 @@ class ClientAccount:
     session_dir: str
     profile_dir: str
     access_expires_at: float
+    authorization_expires_at: float | None = None
+    pending_upload: bool = False
     last_uploaded_at: float | None = None
     last_error: str | None = None
 

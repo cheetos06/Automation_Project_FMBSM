@@ -165,7 +165,7 @@ def install_bundle(
             pass
         raise
 
-    refresh_expires_at = _refresh_expiry(files, now)
+    refresh_expires_at = _refresh_expiry(files, now) or _manifest_authorization_expiry(manifest, now)
     source_version = str(manifest.get("client_version") or manifest.get("version") or "unknown")[:100]
     record = registry.upsert_account(
         account_id=account_id,
@@ -258,6 +258,18 @@ def _refresh_expiry(files: dict[str, bytes], now: float) -> float | None:
         return now + float(seconds) if seconds else None
     except (TypeError, ValueError):
         return None
+
+
+def _manifest_authorization_expiry(manifest: dict[str, Any], now: float) -> float | None:
+    try:
+        expires_at = float(manifest.get("authorization_expires_at"))
+    except (TypeError, ValueError):
+        return None
+    # This is scheduling metadata, not proof of identity. Microsoft session
+    # validation above remains authoritative, and the client value is bounded.
+    if now < expires_at <= now + 25 * 60 * 60:
+        return expires_at
+    return None
 
 
 def _prune_versions(versions_dir: Path, *, keep_path: Path, keep: int) -> None:

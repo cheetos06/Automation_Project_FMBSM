@@ -52,6 +52,12 @@ class AccountRecord:
         }
         data["access_valid"] = self.access_expires_at > current + 60
         data["cooling_down"] = self.cooldown_until > current
+        refresh_potentially_valid = self.refresh_expires_at is None or self.refresh_expires_at > current
+        data["runtime_available"] = bool(
+            self.enabled
+            and not data["cooling_down"]
+            and (data["access_valid"] or refresh_potentially_valid)
+        )
         data["cooldown_remaining_seconds"] = round(max(0.0, self.cooldown_until - current), 1)
         data["access_remaining_seconds"] = round(max(0.0, self.access_expires_at - current), 1)
         return data

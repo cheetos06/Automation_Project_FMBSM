@@ -11,6 +11,7 @@ import unittest
 import urllib.error
 import urllib.request
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -43,7 +44,15 @@ def bundle_bytes(
     )
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w") as archive:
-        archive.writestr("manifest.json", json.dumps({"client_version": "test"}))
+        archive.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "client_version": "test",
+                    "authorization_expires_at": time.time() + 23 * 60 * 60,
+                }
+            ),
+        )
         archive.writestr(
             "private_websocket_raw_frames_test.json",
             json.dumps([{"url": f"https://substrate.office.com/m365Copilot/Chathub/x?access_token={token}"}]),
@@ -73,8 +82,16 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(installed.account.username, "tester@example.com")
             public = installed.account.as_public_dict()
             self.assertEqual(public["username"], "te***@example.com")
+            self.assertGreater(installed.account.refresh_expires_at or 0, time.time() + 22 * 60 * 60)
             self.assertNotIn("last_error", public)
             self.assertNotIn("session_path", public)
+            access_expired = replace(
+                installed.account,
+                access_expires_at=time.time() - 60,
+                refresh_expires_at=None,
+            ).as_public_dict()
+            self.assertFalse(access_expired["access_valid"])
+            self.assertTrue(access_expired["runtime_available"])
             allowed1 = registry.reserve_turn(
                 installed.account.account_id,
                 turn_limit=2,

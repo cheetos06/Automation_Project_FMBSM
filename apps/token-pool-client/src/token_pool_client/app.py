@@ -7,7 +7,8 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, X, messagebox
 import tkinter as tk
@@ -29,15 +30,36 @@ from .automation import (
     update_interval_seconds,
 )
 from .bundle import create_bundle
-from .refresh import initialize_refresh
+from .refresh import initialize_refresh, refresh_existing
 from .storage import AccountStore, ClientAccount
 from .tray import NotificationTray
-from .upload import ClientConfig, load_config, server_status, upload_bundle
+from .upload import (
+    ClientConfig,
+    is_transient_network_error,
+    load_config,
+    server_status,
+    upload_bundle,
+)
 
 
 SAMPLE_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAV0lEQVR4nO3PQQ0AIBDAsAP/nuGNAvZoFSzZOjNnyNi1dwfgUQFeFeBVAV4V4FUBXhXgVQFeFeBVAV4V4FUBXhXgVQFeFeBVAV4V4FUBXhXgVQFeFeBVAV4V4FUB3gA5ggJ/QlTzGAAAAABJRU5ErkJggg=="
 )
+
+
+@dataclass(frozen=True)
+class RenewalBatchResult:
+    successes: int = 0
+    permanent_failures: int = 0
+    transient_failures: int = 0
+
+    @property
+    def failures(self) -> int:
+        return self.permanent_failures + self.transient_failures
+
+    @property
+    def waiting_for_network(self) -> bool:
+        return self.transient_failures > 0
 
 
 class TokenPoolApp:
@@ -144,7 +166,7 @@ class TokenPoolApp:
         for column, label, width in (
             ("account", "Microsoft account", 265),
             ("automation", "Automatic renewal", 140),
-            ("expires", "Access token expires", 155),
+            ("expires", "Microsoft sign-in valid until", 190),
             ("uploaded", "Last uploaded", 155),
             ("status", "Status", 210),
         ):
@@ -184,9 +206,10 @@ class TokenPoolApp:
         now = time.time()
         schedule = " / ".join(self.refresh_times)
         for account in self.store.load():
-            expires = _time_text(account.access_expires_at)
+            authorization_expires_at = _authorization_expires_at(account)
+            expires = _time_text(authorization_expires_at)
             uploaded = _time_text(account.last_uploaded_at) if account.last_uploaded_at else "Never"
-            status = account.last_error or ("Ready" if account.access_expires_at > now + 300 else "Renewal required")
+            status = _account_status(account, now=now)
             automation = schedule if is_automatic_work_account(account.username) else "Manual only"
             self.table.insert(
                 "",
@@ -321,36 +344,82 @@ class TokenPoolApp:
         renewed.last_uploaded_at = account.last_uploaded_at
         return renewed
 
-    def _renew_and_upload(self, accounts: list[ClientAccount], *, automatic: bool) -> tuple[int, int]:
+    def _renew_and_upload(self, accounts: list[ClientAccount], *, automatic: bool) -> RenewalBatchResult:
         if not self.config:
             raise RuntimeError("Client configuration is unavailable")
+        try:
+            server_status(self.config)
+        except Exception as exc:
+            if _is_transient_failure(exc):
+                self.log(f"Network/AWS preflight unavailable; renewal remains pending: {exc}")
+                return RenewalBatchResult(transient_failures=len(accounts))
+            raise
         successes = 0
-        failures = 0
+        permanent_failures = 0
+        transient_failures = 0
         for account in accounts:
             try:
-                renewed = self._fresh_renewal(account, automatic=automatic)
+                if account.pending_upload and (_authorization_expires_at(account) or 0) > time.time() + 300:
+                    renewed = account
+                    if renewed.access_expires_at <= time.time() + 120:
+                        renewed, _ = refresh_existing(renewed)
+                    self.log(f"Retrying the pending AWS upload for {account.username} without another sign-in...")
+                else:
+                    renewed = self._fresh_renewal(account, automatic=automatic)
+                renewed.pending_upload = True
+                renewed.last_error = None
+                self.store.upsert(renewed)
+            except Exception as exc:
+                if _is_transient_failure(exc):
+                    self.log(f"Network unavailable while renewing {account.username}; it will retry automatically: {exc}")
+                    transient_failures += len(accounts) - successes - permanent_failures
+                    break
+                account.pending_upload = False
+                account.last_error = str(exc)[:300]
+                self.store.upsert(account)
+                self.log(f"Microsoft authorization failed for {account.username}: {exc}")
+                permanent_failures += 1
+                continue
+
+            try:
                 response = upload_bundle(self.config, create_bundle(renewed))
                 renewed.last_uploaded_at = time.time()
                 renewed.last_error = None
+                renewed.pending_upload = False
                 self.store.upsert(renewed)
                 available = response.get("pool", {}).get("available_account_count")
                 self.log(f"Uploaded {renewed.username}; server pool available={available}")
                 successes += 1
             except Exception as exc:
-                account.last_error = str(exc)[:300]
-                self.store.upsert(account)
-                self.log(f"Failed {account.username}: {exc}")
-                failures += 1
-        return successes, failures
+                if _is_transient_failure(exc):
+                    self.log(f"AWS upload for {account.username} is pending and will retry automatically: {exc}")
+                    transient_failures += len(accounts) - successes - permanent_failures
+                    break
+                renewed.pending_upload = False
+                renewed.last_error = str(exc)[:300]
+                self.store.upsert(renewed)
+                self.log(f"AWS rejected the upload for {account.username}: {exc}")
+                permanent_failures += 1
+        return RenewalBatchResult(
+            successes=successes,
+            permanent_failures=permanent_failures,
+            transient_failures=transient_failures,
+        )
 
     def refresh_all(self) -> None:
         accounts = self.store.load()
         if not accounts:
             self.log("No account is configured. Choose Add Microsoft account first.")
             return
+
+        def completed(result: object | None, failure: BaseException | None) -> None:
+            batch = result if isinstance(result, RenewalBatchResult) else RenewalBatchResult(permanent_failures=len(accounts))
+            self._notify_renewal_result(batch, failure=failure)
+
         self._background(
             "Renewing all accounts...",
             lambda: self._renew_and_upload(accounts, automatic=False),
+            on_complete=completed,
         )
 
     def refresh_work_now(self) -> None:
@@ -360,14 +429,8 @@ class TokenPoolApp:
             return
 
         def completed(result: object | None, failure: BaseException | None) -> None:
-            successes, failures = result if isinstance(result, tuple) else (0, len(accounts))
-            if failure is not None or failures:
-                self.tray.notify(
-                    "Microsoft sign-in required",
-                    "Your work-account token was not renewed. Open Token Pool Client and complete Microsoft sign-in.",
-                )
-            elif successes:
-                self.tray.notify("FMBSM token renewed", "Your work-account session was refreshed and uploaded successfully.")
+            batch = result if isinstance(result, RenewalBatchResult) else RenewalBatchResult(permanent_failures=len(accounts))
+            self._notify_renewal_result(batch, failure=failure)
 
         self._background(
             "Renewing work account...",
@@ -375,6 +438,31 @@ class TokenPoolApp:
             on_complete=completed,
             show_error=False,
         )
+
+    def _notify_renewal_result(
+        self,
+        result: RenewalBatchResult,
+        *,
+        failure: BaseException | None = None,
+    ) -> None:
+        if result.waiting_for_network or (failure is not None and _is_transient_failure(failure)):
+            if result.permanent_failures:
+                self.tray.notify(
+                    "FMBSM renewal needs attention",
+                    "One account needs sign-in; network-delayed accounts will retry automatically.",
+                )
+            else:
+                self.tray.notify(
+                    "FMBSM renewal waiting for network",
+                    "The internet or AWS service was unavailable. The app will retry automatically.",
+                )
+        elif failure is not None or result.permanent_failures:
+            self.tray.notify(
+                "Microsoft sign-in required",
+                "Your work-account token was not renewed. Open Token Pool Client and complete Microsoft sign-in.",
+            )
+        elif result.successes:
+            self.tray.notify("FMBSM token renewed", "Your work-account session was refreshed and uploaded successfully.")
 
     def add_account(self) -> None:
         if not self.config:
@@ -436,7 +524,7 @@ class TokenPoolApp:
                 f"Turns in the last hour: {pool.get('recent_turns', 0)}",
             ]
             for account in pool.get("accounts", []):
-                state = "cooldown" if account.get("cooling_down") else ("ready" if account.get("access_valid") else "refreshing/expired")
+                state = _server_account_state(account, now=float(pool.get("now") or response.get("now") or time.time()))
                 lines.append(f"{account.get('username')}: {state}, total turns={account.get('total_turns')}")
             text = "\n".join(lines)
             self.log(text.replace("\n", " | "))
@@ -463,28 +551,62 @@ class TokenPoolApp:
         due = latest_due_slot(now, self.refresh_times)
         if due is not None:
             key = slot_key(due)
-            has_work_account = any(is_automatic_work_account(item.username) for item in self.store.load())
-            if has_work_account and key != self.automation_state.last_work_refresh_slot and not self.busy:
-                self.automation_state.last_work_refresh_slot = key
+            accounts = [item for item in self.store.load() if is_automatic_work_account(item.username)]
+            legacy_network_failure = (
+                key == self.automation_state.last_work_refresh_slot
+                and self.automation_state.last_work_refresh_result.startswith("failed")
+                and any(item.last_error and _is_transient_failure(RuntimeError(item.last_error)) for item in accounts)
+            )
+            if legacy_network_failure and not self.automation_state.pending_work_refresh_slot:
+                self.automation_state.pending_work_refresh_slot = key
+                self.automation_state.next_work_retry_at = ""
+
+            pending_this_slot = self.automation_state.pending_work_refresh_slot == key
+            retry_due = pending_this_slot and _retry_is_due(self.automation_state.next_work_retry_at, now)
+            new_slot = key != self.automation_state.last_work_refresh_slot and not pending_this_slot
+            if accounts and (new_slot or retry_due) and not self.busy:
+                if new_slot:
+                    self.automation_state.work_retry_count = 0
+                self.automation_state.pending_work_refresh_slot = key
                 self.automation_state.last_work_refresh_result = "started"
                 self.automation_state.save()
 
                 def completed(result: object | None, failure: BaseException | None) -> None:
-                    successes, failures = result if isinstance(result, tuple) else (0, 1)
-                    self.automation_state.last_work_refresh_result = (
-                        f"success:{successes}" if failure is None and failures == 0 else f"failed:{failures}"
+                    batch = (
+                        result
+                        if isinstance(result, RenewalBatchResult)
+                        else RenewalBatchResult(permanent_failures=len(accounts))
                     )
-                    self.automation_state.save()
-                    if failure is not None or failures:
-                        self.tray.notify(
-                            "Microsoft sign-in required",
-                            "Your work-account token was not renewed. Open Token Pool Client and complete Microsoft sign-in.",
+                    transient = batch.waiting_for_network or (
+                        failure is not None and _is_transient_failure(failure)
+                    )
+                    if transient:
+                        self.automation_state.pending_work_refresh_slot = key
+                        self.automation_state.work_retry_count += 1
+                        retry_seconds = _network_retry_seconds(self.automation_state.work_retry_count)
+                        retry_at = datetime.now().astimezone() + timedelta(seconds=retry_seconds)
+                        self.automation_state.next_work_retry_at = retry_at.isoformat(timespec="seconds")
+                        self.automation_state.last_work_refresh_result = (
+                            f"waiting_for_network:{self.automation_state.work_retry_count}"
                         )
+                        self.log(f"Scheduled renewal will retry at {retry_at.strftime('%H:%M:%S')}.")
+                        if self.automation_state.work_retry_count == 1:
+                            self._notify_renewal_result(batch, failure=failure)
                     else:
-                        self.tray.notify("FMBSM token renewed", "Your work-account session was refreshed and uploaded successfully.")
+                        self.automation_state.last_work_refresh_slot = key
+                        self.automation_state.pending_work_refresh_slot = ""
+                        self.automation_state.next_work_retry_at = ""
+                        self.automation_state.work_retry_count = 0
+                        self.automation_state.last_work_refresh_result = (
+                            f"success:{batch.successes}"
+                            if failure is None and batch.failures == 0
+                            else f"failed:{batch.failures or 1}"
+                        )
+                        self._notify_renewal_result(batch, failure=failure)
+                    self.automation_state.save()
 
-                self.log(f"Scheduled work-account renewal started for slot {key}.")
-                accounts = [item for item in self.store.load() if is_automatic_work_account(item.username)]
+                action = "retried" if pending_this_slot else "started"
+                self.log(f"Scheduled work-account renewal {action} for slot {key}.")
                 self._background(
                     "Scheduled renewal...",
                     lambda: self._renew_and_upload(accounts, automatic=True),
@@ -553,6 +675,70 @@ def _time_text(value: float | None) -> str:
     if not value:
         return "—"
     return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+
+
+def _authorization_expires_at(account: ClientAccount) -> float | None:
+    if account.authorization_expires_at:
+        return account.authorization_expires_at
+    if account.last_uploaded_at:
+        return account.last_uploaded_at + 24 * 60 * 60
+    if account.access_expires_at:
+        # Existing v1.0.10 records predate this field. Their one-hour access
+        # token was created at the start of the fixed 24-hour authorization.
+        return account.access_expires_at + 23 * 60 * 60
+    return None
+
+
+def _is_transient_failure(error: BaseException) -> bool:
+    return isinstance(error, bootstrap.BrowserConnectivityError) or is_transient_network_error(error)
+
+
+def _account_status(account: ClientAccount, *, now: float | None = None) -> str:
+    current = time.time() if now is None else now
+    expires_at = _authorization_expires_at(account)
+    if not expires_at or expires_at <= current + 300:
+        return "Microsoft sign-in renewal due"
+    if account.last_error:
+        if _is_transient_failure(RuntimeError(account.last_error)):
+            return "Waiting for network; retry scheduled"
+        return account.last_error
+    return "Ready"
+
+
+def _server_account_state(account: dict[str, object], *, now: float) -> str:
+    if not account.get("enabled", True):
+        return "disabled"
+    if account.get("cooling_down"):
+        return "cooldown"
+    runtime_available = account.get("runtime_available")
+    if runtime_available is None:
+        refresh_expires_at = account.get("refresh_expires_at")
+        if refresh_expires_at is None:
+            refresh_potentially_valid = True
+        else:
+            try:
+                refresh_potentially_valid = float(refresh_expires_at) > now
+            except (TypeError, ValueError):
+                refresh_potentially_valid = False
+        runtime_available = bool(account.get("access_valid")) or refresh_potentially_valid
+    return "ready" if runtime_available else "Microsoft sign-in renewal due"
+
+
+def _retry_is_due(value: str, now: datetime) -> bool:
+    if not value:
+        return True
+    try:
+        retry_at = datetime.fromisoformat(value)
+    except ValueError:
+        return True
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=now.tzinfo)
+    return now >= retry_at
+
+
+def _network_retry_seconds(retry_count: int) -> int:
+    base = max(30, int(os.getenv("TOKEN_POOL_NETWORK_RETRY_SECONDS", "300")))
+    return min(15 * 60, base * (2 ** min(max(0, retry_count - 1), 2)))
 
 
 def run(*, background: bool = False) -> None:
