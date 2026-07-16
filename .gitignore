@@ -3,6 +3,7 @@
 **/.env.*
 !**/.env.example
 **/client-config.json
+**/admin-config.json
 **/server.crt
 **/server.key
 *.pem

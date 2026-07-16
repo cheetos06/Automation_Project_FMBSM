@@ -7,7 +7,10 @@ import json
 import logging
 import os
 import re
+import shutil
+import socket
 import ssl
+import subprocess
 import threading
 import time
 import uuid
@@ -20,6 +23,7 @@ from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
+from .admin_ping import CopilotPingManager
 from .job_status import JobStatusStore
 from .registry import CopilotRegistry, default_data_dir
 from .session_bundle import MAX_BUNDLE_BYTES, BundleValidationError, install_bundle
@@ -45,6 +49,7 @@ TOKEN_CLIENT_ASSET = re.compile(
     r")\Z"
 )
 MAX_CLIENT_EVENT_BYTES = 4096
+MAX_CONTROL_BODY_BYTES = 32768
 CLIENT_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 CLIENT_EVENT_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,47}\Z")
 CLIENT_ACCOUNT_ID_PATTERN = re.compile(r"account-[A-Za-z0-9._-]{1,80}\Z")
@@ -86,6 +91,7 @@ class TokenApiServer(ThreadingHTTPServer):
         maximum_accounts: int,
         artifact_root: Path,
         artifact_requests_per_hour: int,
+        admin_key: str = "",
     ) -> None:
         super().__init__(address, TokenApiHandler)
         self.registry = registry
@@ -100,6 +106,8 @@ class TokenApiServer(ThreadingHTTPServer):
             artifact_requests_per_hour,
             window_seconds=3600,
         )
+        self.admin_key = admin_key
+        self.ping_manager = CopilotPingManager(registry, status_store)
         self.install_lock = threading.Lock()
         self._used_nonces: dict[str, float] = {}
         self._nonce_lock = threading.Lock()
@@ -164,6 +172,24 @@ class TokenApiHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path.rstrip("/")
         if path == "/v1/client-events":
             self._receive_client_event()
+            return
+        if path == "/v1/client/commands/poll":
+            self._poll_client_commands()
+            return
+        if path == "/v1/client/commands/complete":
+            self._complete_client_command()
+            return
+        if path == "/v1/admin/snapshot":
+            self._admin_snapshot()
+            return
+        if path == "/v1/admin/commands":
+            self._admin_create_commands()
+            return
+        if path == "/v1/admin/commands/cancel":
+            self._admin_cancel_command()
+            return
+        if path == "/v1/admin/copilot-tests":
+            self._admin_start_copilot_test()
             return
         if path != "/v1/accounts/session":
             self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
@@ -306,6 +332,8 @@ class TokenApiHandler(BaseHTTPRequestHandler):
             if isinstance(raw_account_ids, list)
             else []
         )
+        raw_status = payload.get("status")
+        client_status = raw_status if isinstance(raw_status, dict) else {}
         valid = bool(
             CLIENT_ID_PATTERN.fullmatch(client_id)
             and CLIENT_EVENT_PATTERN.fullmatch(event)
@@ -326,6 +354,7 @@ class TokenApiHandler(BaseHTTPRequestHandler):
             app_version=app_version,
             account_ids=account_ids,
             remote_address=self.client_address[0],
+            status=client_status,
         )
         LOGGER.info(
             "Recorded client event id=%s client=%s event=%s slot=%s accounts=%s remote=%s",
@@ -344,6 +373,307 @@ class TokenApiHandler(BaseHTTPRequestHandler):
                 "pool": self.server.registry.status(),
             },
         )
+
+    def _poll_client_commands(self) -> None:
+        parsed = self._read_json_body(MAX_CONTROL_BODY_BYTES)
+        if parsed is None:
+            return
+        body, payload = parsed
+        if not self._authenticated(body):
+            return
+        presence = self._validated_client_presence(payload, event="heartbeat")
+        if presence is None:
+            return
+        self.server.registry.update_client_presence(
+            **presence,
+            remote_address=self.client_address[0],
+        )
+        command = self.server.registry.poll_client_command(
+            presence["client_id"],
+            lease_seconds=10 * 60,
+        )
+        self._json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "server_time": time.time(),
+                "poll_after_seconds": 60,
+                "command": command,
+            },
+        )
+
+    def _complete_client_command(self) -> None:
+        parsed = self._read_json_body(MAX_CONTROL_BODY_BYTES)
+        if parsed is None:
+            return
+        body, payload = parsed
+        if not self._authenticated(body):
+            return
+        client_id = str(payload.get("client_id") or "").lower()
+        command_id = str(payload.get("command_id") or "").lower()
+        result = payload.get("result")
+        succeeded = payload.get("succeeded")
+        if not (
+            CLIENT_ID_PATTERN.fullmatch(client_id)
+            and re.fullmatch(r"[0-9a-f]{32}", command_id)
+            and isinstance(succeeded, bool)
+            and isinstance(result, dict)
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_completion"})
+            return
+        completed = self.server.registry.complete_client_command(
+            client_id=client_id,
+            command_id=command_id,
+            succeeded=succeeded,
+            result=result,
+        )
+        if not completed:
+            self._json(HTTPStatus.CONFLICT, {"ok": False, "error": "command_not_active"})
+            return
+        self._json(HTTPStatus.OK, {"ok": True, "command_id": command_id})
+
+    def _admin_snapshot(self) -> None:
+        parsed = self._read_json_body(MAX_CONTROL_BODY_BYTES)
+        if parsed is None:
+            return
+        body, _payload = parsed
+        if not self._admin_authenticated(body):
+            return
+        registry = self.server.registry
+        now = time.time()
+        account_records = registry.list_accounts(enabled_only=False)
+        account_by_id = {record.account_id: record for record in account_records}
+        accounts: list[dict[str, Any]] = []
+        for record in account_records:
+            value = record.as_public_dict(now=now)
+            value.update(
+                {
+                    "account_id": record.account_id,
+                    "username": record.username,
+                    "last_error": record.last_error,
+                    "uploaded_at": record.uploaded_at,
+                }
+            )
+            if (
+                record.access_expires_at <= now + 60
+                and record.last_error
+                and record.last_error.startswith("token_refresh_failed:")
+            ):
+                value["runtime_available"] = False
+            accounts.append(value)
+
+        commands = registry.list_client_commands(limit=150)
+        active_by_client: dict[str, int] = {}
+        for command in commands:
+            if command["status"] in {"queued", "dispatched"}:
+                client_id = str(command["client_id"])
+                active_by_client[client_id] = active_by_client.get(client_id, 0) + 1
+        clients: list[dict[str, Any]] = []
+        for client in registry.list_clients():
+            account_names = [
+                account_by_id[account_id].username
+                for account_id in client["account_ids"]
+                if account_id in account_by_id
+            ]
+            item = dict(client)
+            item["account_usernames"] = account_names
+            item["online"] = now - float(client["last_seen_at"]) <= 150
+            item["seconds_since_seen"] = round(max(0.0, now - float(client["last_seen_at"])), 1)
+            item["active_command_count"] = active_by_client.get(str(client["client_id"]), 0)
+            clients.append(item)
+        self._json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "now": now,
+                "server": _server_metrics(self.server.started_at),
+                "pool": {
+                    **registry.status(),
+                    "accounts": accounts,
+                },
+                "clients": clients,
+                "commands": commands,
+                "client_events": registry.recent_client_events(limit=100),
+                "copilot_tests": self.server.ping_manager.recent(limit=20),
+                "jobs": [
+                    _public_job(job)
+                    for job in self.server.status_store.recent(limit=20)
+                ],
+            },
+        )
+
+    def _admin_create_commands(self) -> None:
+        parsed = self._read_json_body(MAX_CONTROL_BODY_BYTES)
+        if parsed is None:
+            return
+        body, payload = parsed
+        if not self._admin_authenticated(body):
+            return
+        raw_client_ids = payload.get("client_ids")
+        client_ids = (
+            list(dict.fromkeys(str(value).lower() for value in raw_client_ids))
+            if isinstance(raw_client_ids, list)
+            else []
+        )
+        command = str(payload.get("command") or "")
+        command_payload = payload.get("payload")
+        try:
+            expires_in = float(payload.get("expires_in_seconds") or 15 * 60)
+        except (TypeError, ValueError):
+            expires_in = 0.0
+        if not (
+            1 <= len(client_ids) <= 20
+            and all(CLIENT_ID_PATTERN.fullmatch(value) for value in client_ids)
+            and command in {"force_renew", "force_update"}
+            and isinstance(command_payload, dict)
+            and 60 <= expires_in <= 24 * 60 * 60
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_command"})
+            return
+        if command == "force_renew" and command_payload.get("interaction") not in {
+            "silent_only",
+            "allow_visible",
+        }:
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_interaction_mode"})
+            return
+        now = time.time()
+        clients = {item["client_id"]: item for item in self.server.registry.list_clients()}
+        created: list[dict[str, Any]] = []
+        rejected: list[dict[str, str]] = []
+        for client_id in client_ids:
+            client = clients.get(client_id)
+            if client is None:
+                rejected.append({"client_id": client_id, "reason": "unknown_client"})
+                continue
+            if now - float(client["last_seen_at"]) > 150:
+                rejected.append({"client_id": client_id, "reason": "client_offline"})
+                continue
+            created.append(
+                self.server.registry.create_client_command(
+                    client_id=client_id,
+                    command=command,
+                    payload=command_payload,
+                    expires_in_seconds=expires_in,
+                    requested_by="token-pool-admin",
+                )
+            )
+        self._json(
+            HTTPStatus.OK,
+            {"ok": True, "created": created, "rejected": rejected},
+        )
+
+    def _admin_cancel_command(self) -> None:
+        parsed = self._read_json_body(MAX_CONTROL_BODY_BYTES)
+        if parsed is None:
+            return
+        body, payload = parsed
+        if not self._admin_authenticated(body):
+            return
+        command_id = str(payload.get("command_id") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", command_id):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_command_id"})
+            return
+        cancelled = self.server.registry.cancel_client_command(command_id)
+        self._json(HTTPStatus.OK, {"ok": True, "cancelled": cancelled})
+
+    def _admin_start_copilot_test(self) -> None:
+        parsed = self._read_json_body(MAX_CONTROL_BODY_BYTES)
+        if parsed is None:
+            return
+        body, payload = parsed
+        if not self._admin_authenticated(body):
+            return
+        raw_account_ids = payload.get("account_ids")
+        account_ids = (
+            list(dict.fromkeys(str(value) for value in raw_account_ids))
+            if isinstance(raw_account_ids, list)
+            else []
+        )
+        if not (
+            1 <= len(account_ids) <= 20
+            and all(CLIENT_ACCOUNT_ID_PATTERN.fullmatch(value) for value in account_ids)
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_account_selection"})
+            return
+        try:
+            job = self.server.ping_manager.start(account_ids)
+        except ValueError as exc:
+            self._json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "invalid_account_selection", "detail": str(exc)},
+            )
+            return
+        except RuntimeError as exc:
+            self._json(
+                HTTPStatus.CONFLICT,
+                {"ok": False, "error": "copilot_test_already_running", "detail": str(exc)},
+            )
+            return
+        self._json(HTTPStatus.ACCEPTED, {"ok": True, "job": job})
+
+    def _read_json_body(self, maximum_bytes: int) -> tuple[bytes, dict[str, Any]] | None:
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._json(HTTPStatus.LENGTH_REQUIRED, {"ok": False, "error": "invalid_content_length"})
+            return None
+        if length < 2 or length > maximum_bytes:
+            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"ok": False, "error": "request_too_large"})
+            return None
+        self.connection.settimeout(15)
+        body = self.rfile.read(length)
+        if len(body) != length:
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "incomplete_body"})
+            return None
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json"})
+            return None
+        if not isinstance(payload, dict):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json_object"})
+            return None
+        return body, payload
+
+    def _validated_client_presence(
+        self,
+        payload: dict[str, Any],
+        *,
+        event: str,
+    ) -> dict[str, Any] | None:
+        client_id = str(payload.get("client_id") or "").lower()
+        app_version = str(payload.get("app_version") or "")[:64] or None
+        scheduled_slot = str(payload.get("scheduled_slot") or "")[:64] or None
+        try:
+            observed_at = float(payload.get("observed_at"))
+        except (TypeError, ValueError):
+            observed_at = 0.0
+        raw_ids = payload.get("account_ids")
+        account_ids = (
+            list(dict.fromkeys(str(value) for value in raw_ids))
+            if isinstance(raw_ids, list)
+            else []
+        )
+        raw_status = payload.get("status")
+        status = raw_status if isinstance(raw_status, dict) else {}
+        if not (
+            CLIENT_ID_PATTERN.fullmatch(client_id)
+            and observed_at > 0
+            and abs(time.time() - observed_at) <= 10 * 60
+            and len(account_ids) <= 20
+            and all(CLIENT_ACCOUNT_ID_PATTERN.fullmatch(value) for value in account_ids)
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_client_presence"})
+            return None
+        return {
+            "client_id": client_id,
+            "observed_at": observed_at,
+            "event": event,
+            "scheduled_slot": scheduled_slot,
+            "app_version": app_version,
+            "account_ids": account_ids,
+            "status": status,
+        }
 
     def do_HEAD(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path.rstrip("/") or "/"
@@ -439,6 +769,53 @@ class TokenApiHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _admin_authenticated(self, body: bytes) -> bool:
+        if (
+            not isinstance(self.connection, ssl.SSLSocket)
+            and self.client_address[0] not in {"127.0.0.1", "::1"}
+        ):
+            self._json(
+                HTTPStatus.UPGRADE_REQUIRED,
+                {"ok": False, "error": "admin_https_required"},
+            )
+            return False
+        if len(self.server.admin_key) < 32:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False, "error": "admin_api_disabled"})
+            return False
+        timestamp_text = self.headers.get("X-FMBSM-Admin-Timestamp", "")
+        nonce = self.headers.get("X-FMBSM-Admin-Nonce", "")
+        signature = self.headers.get("X-FMBSM-Admin-Signature", "")
+        try:
+            timestamp = float(timestamp_text)
+        except ValueError:
+            timestamp = 0.0
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        valid_shape = bool(
+            len(nonce) == 32
+            and all(character in "0123456789abcdef" for character in nonce.lower())
+            and abs(time.time() - timestamp) <= 300
+            and len(signature) == 64
+        )
+        if valid_shape:
+            canonical = "\n".join(
+                (
+                    timestamp_text,
+                    nonce,
+                    self.command.upper(),
+                    path,
+                    hashlib.sha256(body).hexdigest(),
+                )
+            ).encode("utf-8")
+            expected = hmac.new(
+                self.server.admin_key.encode("utf-8"),
+                canonical,
+                hashlib.sha256,
+            ).hexdigest()
+            if hmac.compare_digest(signature.lower(), expected) and self.server.consume_nonce(nonce, timestamp):
+                return True
+        self._json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "admin_unauthorized"})
+        return False
+
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         body = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         self.send_response(status)
@@ -462,6 +839,62 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _server_metrics(process_started_at: float) -> dict[str, Any]:
+    now = time.time()
+    try:
+        system_uptime = float(Path("/proc/uptime").read_text(encoding="ascii").split()[0])
+    except (OSError, ValueError, IndexError):
+        system_uptime = None
+    try:
+        load_average = [round(value, 2) for value in os.getloadavg()]
+    except (AttributeError, OSError):
+        load_average = []
+    memory: dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            key, _, raw = line.partition(":")
+            if key in {"MemTotal", "MemAvailable"}:
+                memory[key] = int(raw.strip().split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        memory = {}
+    try:
+        disk = shutil.disk_usage("/")
+        disk_value = {"total": disk.total, "used": disk.used, "free": disk.free}
+    except OSError:
+        disk_value = {}
+
+    services: dict[str, str] = {}
+    for name in (
+        "fmbsm-token-api.service",
+        "fmbsm-token-api-http.service",
+        "fmbsm-email-bot.service",
+    ):
+        try:
+            completed = subprocess.run(
+                ["systemctl", "is-active", name],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            services[name] = (completed.stdout.strip() or "inactive")[:40]
+        except (OSError, subprocess.SubprocessError):
+            services[name] = "unknown"
+    return {
+        "host": socket.gethostname(),
+        "server_time": now,
+        "api_uptime_seconds": round(max(0.0, now - process_started_at), 1),
+        "system_uptime_seconds": round(system_uptime, 1) if system_uptime is not None else None,
+        "load_average": load_average,
+        "memory": {
+            "total": memory.get("MemTotal"),
+            "available": memory.get("MemAvailable"),
+        },
+        "disk": disk_value,
+        "services": services,
+    }
+
+
 def _load_environment() -> Path:
     project = Path(__file__).resolve().parents[1]
     env_file = Path(os.getenv("ENV_FILE") or project / ".env")
@@ -482,6 +915,9 @@ def main() -> int:
     upload_key = os.getenv("COPILOT_UPLOAD_KEY", "").strip()
     if len(upload_key) < 32:
         raise RuntimeError("COPILOT_UPLOAD_KEY must contain at least 32 characters")
+    admin_key = os.getenv("TOKEN_ADMIN_KEY", "").strip()
+    if admin_key and len(admin_key) < 32:
+        raise RuntimeError("TOKEN_ADMIN_KEY must be empty or contain at least 32 characters")
     host = os.getenv("TOKEN_API_HOST", "0.0.0.0")
     port = args.port or int(os.getenv("TOKEN_API_PORT", "443"))
     registry = CopilotRegistry.from_env()
@@ -514,6 +950,7 @@ def main() -> int:
             20,
             int(os.getenv("TOKEN_CLIENT_DOWNLOADS_PER_HOUR", "120")),
         ),
+        admin_key=admin_key,
     )
     insecure = args.insecure_http or os.getenv("TOKEN_API_INSECURE_HTTP", "").lower() in {"1", "true", "yes"}
     if not insecure:

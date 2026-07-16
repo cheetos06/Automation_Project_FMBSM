@@ -136,6 +136,7 @@ def client_preflight(
     event: str,
     account_ids: list[str],
     scheduled_slot: str | None = None,
+    status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Report one signed presence event and obtain pool status in the same request.
 
@@ -152,6 +153,7 @@ def client_preflight(
             "scheduled_slot": scheduled_slot,
             "app_version": __version__,
             "account_ids": list(dict.fromkeys(account_ids)),
+            "status": status or {},
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -219,10 +221,17 @@ def _request_with_retry(
 ) -> dict[str, Any]:
     last_error: TransientNetworkError | None = None
     for attempt in range(1, attempts + 1):
+        request = request_factory()
         try:
-            return _open_json(request_factory(), config, timeout_seconds=timeout_seconds)
+            return _open_json(request, config, timeout_seconds=timeout_seconds)
         except TransientNetworkError as exc:
             last_error = exc
+            alternate = _alternate_transport_request(request, config)
+            if alternate is not None:
+                try:
+                    return _open_json(alternate, config, timeout_seconds=timeout_seconds)
+                except TransientNetworkError as alternate_exc:
+                    last_error = alternate_exc
             if attempt == attempts:
                 break
             time.sleep(attempt)
@@ -238,7 +247,7 @@ def _open_json(
     timeout_seconds: float,
 ) -> dict[str, Any]:
     handlers: list[urllib.request.BaseHandler] = []
-    if urllib.parse.urlsplit(config.endpoint).scheme.lower() == "https":
+    if urllib.parse.urlsplit(request.full_url).scheme.lower() == "https":
         context = ssl.create_default_context(cafile=str(config.ca_certificate))
         handlers.append(urllib.request.HTTPSHandler(context=context))
     opener = urllib.request.build_opener(*handlers)
@@ -259,3 +268,37 @@ def _open_json(
         raise TransientNetworkError(
             "The internet or AWS token service is temporarily unavailable. The app will retry automatically."
         ) from exc
+
+
+def _alternate_transport_request(
+    request: urllib.request.Request,
+    config: ClientConfig,
+) -> urllib.request.Request | None:
+    """Retry the same signed operation through the server's other listener.
+
+    Some company networks intermittently block the HTTP listener while others
+    block HTTPS CONNECT tunnelling. The AWS service intentionally exposes both.
+    Every alternate attempt receives a new nonce and signature, and HTTPS still
+    uses the pinned certificate.
+    """
+
+    parsed = urllib.parse.urlsplit(request.full_url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return None
+    alternate_scheme = "https" if parsed.scheme.lower() == "http" else "http"
+    alternate_url = urllib.parse.urlunsplit(
+        (alternate_scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+    headers = {
+        key: value
+        for key, value in request.header_items()
+        if not key.lower().startswith("x-fmbsm-")
+    }
+    body = request.data or b""
+    alternate = urllib.request.Request(
+        alternate_url,
+        data=request.data,
+        headers=headers,
+        method=request.get_method(),
+    )
+    return _sign(alternate, config.upload_key, body)

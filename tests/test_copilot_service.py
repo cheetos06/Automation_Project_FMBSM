@@ -13,19 +13,28 @@ import urllib.request
 import zipfile
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVICE = ROOT / "services" / "automation-mail-worker"
 CLIENT = ROOT / "apps" / "token-pool-client" / "src"
+ADMIN = ROOT / "apps" / "token-pool-admin" / "src"
 sys.path.insert(0, str(SERVICE))
 sys.path.insert(0, str(CLIENT))
+sys.path.insert(0, str(ADMIN))
 
 from copilot_service.registry import CopilotRegistry  # noqa: E402
+from copilot_service.admin_ping import CopilotPingManager  # noqa: E402
+from copilot_service.job_status import JobStatusStore  # noqa: E402
 from copilot_service.session_bundle import BundleValidationError, install_bundle  # noqa: E402
 from copilot_service.token_api import TokenApiServer  # noqa: E402
 from token_pool_client.upload import ClientConfig, client_preflight  # noqa: E402
+from token_pool_client.control import complete_admin_command, poll_admin_commands  # noqa: E402
+from token_pool_admin.api import AdminApiError  # noqa: E402
+from token_pool_admin.api import create_commands as admin_create_commands  # noqa: E402
+from token_pool_admin.api import snapshot as admin_snapshot  # noqa: E402
+from token_pool_admin.storage import AdminConfig  # noqa: E402
 
 
 def fake_jwt(claims: dict[str, object]) -> str:
@@ -79,6 +88,118 @@ def bundle_bytes(
 
 
 class RegistryTests(unittest.TestCase):
+    def test_copilot_health_tests_cannot_be_accidentally_queued_twice(self) -> None:
+        registry = MagicMock()
+        registry.list_accounts.return_value = [MagicMock(account_id="account-test")]
+        status_store = MagicMock()
+        status_store.update.return_value = {"job_id": "test", "stage": "queued"}
+        manager = CopilotPingManager(registry, status_store)
+        with patch("copilot_service.admin_ping.threading.Thread.start"):
+            manager.start(["account-test"])
+            with self.assertRaisesRegex(RuntimeError, "already running"):
+                manager.start(["account-test"])
+
+    def test_expired_admin_command_is_never_delivered(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            registry = CopilotRegistry(Path(temporary) / "registry")
+            client_id = "c" * 32
+            registry.update_client_presence(
+                client_id=client_id,
+                observed_at=1000,
+                event="heartbeat",
+                scheduled_slot=None,
+                app_version="test",
+                account_ids=[],
+                remote_address="127.0.0.1",
+                status={"busy": False},
+            )
+            with patch("copilot_service.registry.time.time", return_value=1000):
+                command = registry.create_client_command(
+                    client_id=client_id,
+                    command="force_update",
+                    payload={},
+                    expires_in_seconds=60,
+                )
+            with patch("copilot_service.registry.time.time", return_value=1061):
+                self.assertIsNone(registry.poll_client_command(client_id))
+            self.assertEqual(
+                registry.get_client_command(command["command_id"])["status"],
+                "expired",
+            )
+
+    def test_admin_command_round_trip_is_separately_authenticated_and_audited(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry = CopilotRegistry(root / "registry")
+            status_store = JobStatusStore(root / "job-status")
+            artifact_root = root / "artifacts"
+            artifact_root.mkdir()
+            server = TokenApiServer(
+                ("127.0.0.1", 0),
+                registry=registry,
+                upload_key="u" * 32,
+                admin_key="a" * 32,
+                status_store=status_store,
+                requests_per_minute=20,
+                transport_private_key=None,
+                session_validator=object(),
+                maximum_accounts=1,
+                artifact_root=artifact_root,
+                artifact_requests_per_hour=10,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            endpoint = f"http://127.0.0.1:{server.server_port}"
+            client_config = ClientConfig(endpoint, "u" * 32, root / "unused.pem", "repo")
+            admin_config = AdminConfig(endpoint, "a" * 32, root / "unused.pem")
+            environment = {
+                "TOKEN_POOL_CLIENT_DATA": str(root / "client"),
+                "NO_PROXY": "127.0.0.1,localhost",
+                "no_proxy": "127.0.0.1,localhost",
+            }
+            try:
+                with patch.dict("os.environ", environment):
+                    with self.assertRaisesRegex(AdminApiError, "rejected"):
+                        admin_snapshot(AdminConfig(endpoint, "x" * 32, root / "unused.pem"))
+                    client_preflight(
+                        client_config,
+                        event="scheduled_refresh",
+                        account_ids=["account-test"],
+                        scheduled_slot="2026-07-16T09:45+01:00",
+                        status={"busy": False},
+                    )
+                    initial = admin_snapshot(admin_config)
+                    self.assertEqual(len(initial["clients"]), 1)
+                    client_id = initial["clients"][0]["client_id"]
+                    created = admin_create_commands(
+                        admin_config,
+                        client_ids=[client_id],
+                        command="force_renew",
+                        payload={"interaction": "silent_only"},
+                    )
+                    self.assertEqual(len(created["created"]), 1)
+                    polled = poll_admin_commands(
+                        client_config,
+                        account_ids=["account-test"],
+                        status={"busy": False},
+                    )
+                    command = polled["command"]
+                    self.assertEqual(command["command"], "force_renew")
+                    self.assertEqual(command["payload"]["interaction"], "silent_only")
+                    complete_admin_command(
+                        client_config,
+                        command_id=command["command_id"],
+                        succeeded=True,
+                        result={"successes": 1},
+                    )
+                    final = admin_snapshot(admin_config)
+                    self.assertEqual(final["commands"][0]["status"], "completed")
+                    self.assertEqual(final["commands"][0]["result"]["successes"], 1)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
     def test_signed_client_preflight_records_scheduled_presence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

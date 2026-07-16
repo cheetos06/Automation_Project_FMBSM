@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+import urllib.request
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -46,6 +47,7 @@ from token_pool_client.app import (  # noqa: E402
 )
 from token_pool_client.bootstrap import (  # noqa: E402
     BrowserConnectivityError,
+    InteractiveAuthenticationRequired,
     explicit_authentication_required,
     navigate,
     upload_image_or_pause,
@@ -62,6 +64,7 @@ from token_pool_client.upload import (  # noqa: E402
     ServerRejectedError,
     TransientNetworkError,
     _request_with_retry,
+    _sign,
     client_preflight,
     is_transient_network_error,
 )
@@ -397,10 +400,14 @@ class ClientBundleTests(unittest.TestCase):
     def test_transient_connectivity_is_friendly_and_retried_with_new_request(self) -> None:
         self.assertTrue(is_transient_network_error(OSError("[WinError 10060] failed to respond")))
         config = ClientConfig("http://example.invalid", "key", Path("unused"), "repo")
-        requests: list[object] = []
+        requests: list[urllib.request.Request] = []
 
-        def request_factory() -> object:
-            request = object()
+        def request_factory() -> urllib.request.Request:
+            request = _sign(
+                urllib.request.Request("http://example.invalid/v1/status"),
+                config.upload_key,
+                b"",
+            )
             requests.append(request)
             return request
 
@@ -413,9 +420,14 @@ class ClientBundleTests(unittest.TestCase):
                     _request_with_retry(request_factory, config, timeout_seconds=1, attempts=2),
                     {"ok": True},
                 )
-        self.assertEqual(len(requests), 2)
-        self.assertIsNot(requests[0], requests[1])
+        self.assertEqual(len(requests), 1)
         self.assertEqual(open_json.call_count, 2)
+        alternate = open_json.call_args_list[1].args[0]
+        self.assertEqual(alternate.full_url, "https://example.invalid/v1/status")
+        self.assertNotEqual(
+            requests[0].get_header("X-fmbsm-nonce"),
+            alternate.get_header("X-fmbsm-nonce"),
+        )
 
     def test_offline_preflight_does_not_open_microsoft_and_remains_pending(self) -> None:
         account = ClientAccount(
@@ -528,6 +540,27 @@ class ClientBundleTests(unittest.TestCase):
                 "Approve sign in request in Microsoft Authenticator",
             )
         )
+
+    def test_remote_silent_only_renewal_never_opens_visible_edge(self) -> None:
+        account = ClientAccount(
+            account_id="account-test",
+            username="tester@mazars.fr",
+            tenant_id="tenant",
+            object_id="object",
+            session_dir="session",
+            profile_dir="profile",
+            access_expires_at=0,
+        )
+        app = TokenPoolApp.__new__(TokenPoolApp)
+        app.log = MagicMock()
+        with patch(
+            "token_pool_client.app.bootstrap.renew_microsoft_session",
+            side_effect=InteractiveAuthenticationRequired("MFA required"),
+        ) as renew:
+            with self.assertRaisesRegex(Exception, "MFA required"):
+                app._fresh_renewal(account, automatic=True, allow_visible=False)
+        renew.assert_called_once()
+        self.assertTrue(any("Edge was not opened" in str(call) for call in app.log.call_args_list))
 
     def test_expired_spa_refresh_token_requires_real_sign_in(self) -> None:
         self.assertTrue(

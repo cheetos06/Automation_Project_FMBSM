@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -161,6 +163,34 @@ class CopilotRegistry:
                 );
                 CREATE INDEX IF NOT EXISTS idx_client_events_client_time
                     ON client_events(client_id, received_at DESC);
+                CREATE TABLE IF NOT EXISTS clients (
+                    client_id TEXT PRIMARY KEY,
+                    first_seen_at REAL NOT NULL,
+                    last_seen_at REAL NOT NULL,
+                    app_version TEXT,
+                    account_ids TEXT,
+                    last_event TEXT,
+                    scheduled_slot TEXT,
+                    status_json TEXT,
+                    remote_address TEXT
+                );
+                CREATE TABLE IF NOT EXISTS client_commands (
+                    command_id TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL REFERENCES clients(client_id) ON DELETE CASCADE,
+                    command TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    dispatched_at REAL,
+                    lease_until REAL,
+                    finished_at REAL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    result_json TEXT,
+                    requested_by TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_client_commands_poll
+                    ON client_commands(client_id, status, created_at);
                 """
             )
             connection.execute(
@@ -254,6 +284,7 @@ class CopilotRegistry:
         app_version: str | None,
         account_ids: list[str],
         remote_address: str | None,
+        status: dict[str, Any] | None = None,
     ) -> int:
         """Persist a small signed client-presence event for operational diagnosis."""
 
@@ -277,10 +308,279 @@ class CopilotRegistry:
                     remote_address,
                 ),
             )
+            self._upsert_client_presence(
+                connection,
+                client_id=client_id,
+                observed_at=observed_at,
+                event=event,
+                scheduled_slot=scheduled_slot,
+                app_version=app_version,
+                account_ids=account_ids,
+                remote_address=remote_address,
+                status=status,
+            )
             # Two scheduled events per day are expected. Ninety days keeps the
             # diagnostic table small while leaving enough history for audits.
             connection.execute("DELETE FROM client_events WHERE received_at < ?", (now - 90 * 24 * 60 * 60,))
             return int(cursor.lastrowid)
+
+    def update_client_presence(
+        self,
+        *,
+        client_id: str,
+        observed_at: float,
+        event: str,
+        scheduled_slot: str | None,
+        app_version: str | None,
+        account_ids: list[str],
+        remote_address: str | None,
+        status: dict[str, Any] | None = None,
+    ) -> None:
+        with self._connect(immediate=True) as connection:
+            self._upsert_client_presence(
+                connection,
+                client_id=client_id,
+                observed_at=observed_at,
+                event=event,
+                scheduled_slot=scheduled_slot,
+                app_version=app_version,
+                account_ids=account_ids,
+                remote_address=remote_address,
+                status=status,
+            )
+
+    @staticmethod
+    def _upsert_client_presence(
+        connection: sqlite3.Connection,
+        *,
+        client_id: str,
+        observed_at: float,
+        event: str,
+        scheduled_slot: str | None,
+        app_version: str | None,
+        account_ids: list[str],
+        remote_address: str | None,
+        status: dict[str, Any] | None,
+    ) -> None:
+        status_json = json.dumps(status or {}, ensure_ascii=True, separators=(",", ":"))
+        connection.execute(
+            """
+            INSERT INTO clients(
+                client_id, first_seen_at, last_seen_at, app_version, account_ids,
+                last_event, scheduled_slot, status_json, remote_address
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(client_id) DO UPDATE SET
+                last_seen_at=excluded.last_seen_at,
+                app_version=excluded.app_version,
+                account_ids=excluded.account_ids,
+                last_event=excluded.last_event,
+                scheduled_slot=COALESCE(excluded.scheduled_slot, clients.scheduled_slot),
+                status_json=excluded.status_json,
+                remote_address=excluded.remote_address
+            """,
+            (
+                client_id,
+                observed_at,
+                observed_at,
+                app_version,
+                ",".join(account_ids),
+                event,
+                scheduled_slot,
+                status_json,
+                remote_address,
+            ),
+        )
+
+    def list_clients(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM clients ORDER BY last_seen_at DESC, client_id"
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                status = json.loads(str(row["status_json"] or "{}"))
+            except json.JSONDecodeError:
+                status = {}
+            result.append(
+                {
+                    "client_id": str(row["client_id"]),
+                    "first_seen_at": float(row["first_seen_at"]),
+                    "last_seen_at": float(row["last_seen_at"]),
+                    "app_version": str(row["app_version"] or ""),
+                    "account_ids": [
+                        value for value in str(row["account_ids"] or "").split(",") if value
+                    ],
+                    "last_event": str(row["last_event"] or ""),
+                    "scheduled_slot": str(row["scheduled_slot"]) if row["scheduled_slot"] else None,
+                    "status": status if isinstance(status, dict) else {},
+                    "remote_address": str(row["remote_address"] or ""),
+                }
+            )
+        return result
+
+    def create_client_command(
+        self,
+        *,
+        client_id: str,
+        command: str,
+        payload: dict[str, Any],
+        expires_in_seconds: float,
+        requested_by: str = "admin",
+    ) -> dict[str, Any]:
+        now = time.time()
+        command_id = uuid.uuid4().hex
+        with self._connect(immediate=True) as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM clients WHERE client_id=?", (client_id,)
+            ).fetchone()
+            if exists is None:
+                raise KeyError(f"Unknown client: {client_id}")
+            connection.execute(
+                """
+                INSERT INTO client_commands(
+                    command_id, client_id, command, payload_json, status,
+                    created_at, expires_at, requested_by
+                ) VALUES(?, ?, ?, ?, 'queued', ?, ?, ?)
+                """,
+                (
+                    command_id,
+                    client_id,
+                    command,
+                    json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+                    now,
+                    now + max(60.0, min(float(expires_in_seconds), 24 * 60 * 60)),
+                    requested_by,
+                ),
+            )
+        return self.get_client_command(command_id) or {}
+
+    def poll_client_command(self, client_id: str, *, lease_seconds: float = 180) -> dict[str, Any] | None:
+        now = time.time()
+        with self._connect(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE client_commands
+                SET status='expired', finished_at=?
+                WHERE client_id=? AND status IN ('queued', 'dispatched') AND expires_at<=?
+                """,
+                (now, client_id, now),
+            )
+            connection.execute(
+                """
+                UPDATE client_commands
+                SET status=CASE WHEN attempts>=3 THEN 'failed' ELSE 'queued' END,
+                    finished_at=CASE WHEN attempts>=3 THEN ? ELSE NULL END,
+                    result_json=CASE WHEN attempts>=3 THEN ? ELSE result_json END,
+                    lease_until=NULL
+                WHERE client_id=? AND status='dispatched' AND lease_until<=?
+                """,
+                (
+                    now,
+                    json.dumps({"error": "client command lease expired three times"}),
+                    client_id,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM client_commands
+                WHERE client_id=? AND status='queued' AND expires_at>?
+                ORDER BY created_at, command_id
+                LIMIT 1
+                """,
+                (client_id, now),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE client_commands
+                SET status='dispatched', dispatched_at=?, lease_until=?, attempts=attempts+1
+                WHERE command_id=?
+                """,
+                (now, now + max(60.0, lease_seconds), str(row["command_id"])),
+            )
+        return self.get_client_command(str(row["command_id"]))
+
+    def complete_client_command(
+        self,
+        *,
+        client_id: str,
+        command_id: str,
+        succeeded: bool,
+        result: dict[str, Any],
+    ) -> bool:
+        now = time.time()
+        with self._connect(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE client_commands
+                SET status=?, finished_at=?, lease_until=NULL, result_json=?
+                WHERE command_id=? AND client_id=? AND status IN ('queued', 'dispatched')
+                """,
+                (
+                    "completed" if succeeded else "failed",
+                    now,
+                    json.dumps(result, ensure_ascii=True, separators=(",", ":"))[:8000],
+                    command_id,
+                    client_id,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def cancel_client_command(self, command_id: str) -> bool:
+        now = time.time()
+        with self._connect(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE client_commands SET status='cancelled', finished_at=?, lease_until=NULL
+                WHERE command_id=? AND status IN ('queued', 'dispatched')
+                """,
+                (now, command_id),
+            )
+            return cursor.rowcount == 1
+
+    def get_client_command(self, command_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM client_commands WHERE command_id=?", (command_id,)
+            ).fetchone()
+        return self._client_command(row) if row else None
+
+    def list_client_commands(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        bounded_limit = min(max(1, int(limit)), 500)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM client_commands ORDER BY created_at DESC LIMIT ?",
+                (bounded_limit,),
+            ).fetchall()
+        return [self._client_command(row) for row in rows]
+
+    @staticmethod
+    def _client_command(row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        try:
+            result = json.loads(str(row["result_json"] or "{}"))
+        except json.JSONDecodeError:
+            result = {}
+        return {
+            "command_id": str(row["command_id"]),
+            "client_id": str(row["client_id"]),
+            "command": str(row["command"]),
+            "payload": payload if isinstance(payload, dict) else {},
+            "status": str(row["status"]),
+            "created_at": float(row["created_at"]),
+            "expires_at": float(row["expires_at"]),
+            "dispatched_at": float(row["dispatched_at"]) if row["dispatched_at"] else None,
+            "finished_at": float(row["finished_at"]) if row["finished_at"] else None,
+            "attempts": int(row["attempts"] or 0),
+            "result": result if isinstance(result, dict) else {},
+            "requested_by": str(row["requested_by"] or ""),
+        }
 
     def recent_client_events(self, *, limit: int = 50) -> list[dict[str, Any]]:
         bounded_limit = min(max(1, int(limit)), 200)

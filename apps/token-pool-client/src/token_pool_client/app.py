@@ -30,6 +30,11 @@ from .automation import (
     update_interval_seconds,
 )
 from .bundle import create_bundle
+from .control import (
+    flush_admin_command_results,
+    poll_admin_commands,
+    queue_admin_command_result,
+)
 from .refresh import initialize_refresh, refresh_existing
 from .storage import AccountStore, ClientAccount
 from .tray import NotificationTray
@@ -77,6 +82,8 @@ class TokenPoolApp:
         self.update_interval = update_interval_seconds()
         self.automation_state = AutomationState.load(self.store.root)
         self.next_update_check = time.monotonic() + self.update_interval
+        self.next_control_poll = time.monotonic() + 5
+        self.control_polling = False
         self.log_path = self.store.root / "client.log"
         self.log_lock = threading.Lock()
         self.root.title(f"FMBSM Token Pool Client {__version__}")
@@ -295,7 +302,13 @@ class TokenPoolApp:
         self.root.after(0, show)
         event.wait()
 
-    def _fresh_renewal(self, account: ClientAccount, *, automatic: bool) -> ClientAccount:
+    def _fresh_renewal(
+        self,
+        account: ClientAccount,
+        *,
+        automatic: bool,
+        allow_visible: bool = True,
+    ) -> ClientAccount:
         self.log(f"Requesting a new 24-hour Microsoft authorization for {account.username}...")
         try:
             summary = bootstrap.renew_microsoft_session(
@@ -313,6 +326,11 @@ class TokenPoolApp:
             method = "headless Microsoft SSO"
         except bootstrap.InteractiveAuthenticationRequired as exc:
             self.log(f"Silent fresh authorization needs user interaction: {exc}")
+            if not allow_visible:
+                self.log(
+                    f"Silent-only renewal stopped for {account.username}; Edge was not opened."
+                )
+                raise
             self.log(f"Opening Edge for {account.username}; complete sign-in/MFA if Microsoft asks...")
             manual_multi_account = not is_automatic_work_account(account.username)
             if not automatic:
@@ -353,6 +371,7 @@ class TokenPoolApp:
         automatic: bool,
         client_event: str = "refresh_preflight",
         scheduled_slot: str | None = None,
+        allow_visible: bool = True,
     ) -> RenewalBatchResult:
         if not self.config:
             raise RuntimeError("Client configuration is unavailable")
@@ -362,6 +381,7 @@ class TokenPoolApp:
                 event=client_event,
                 account_ids=[account.account_id for account in accounts],
                 scheduled_slot=scheduled_slot,
+                status=self._client_control_status(),
             )
         except Exception as exc:
             if _is_transient_failure(exc):
@@ -379,7 +399,11 @@ class TokenPoolApp:
                         renewed, _ = refresh_existing(renewed)
                     self.log(f"Retrying the pending AWS upload for {account.username} without another sign-in...")
                 else:
-                    renewed = self._fresh_renewal(account, automatic=automatic)
+                    renewed = self._fresh_renewal(
+                        account,
+                        automatic=automatic,
+                        allow_visible=allow_visible,
+                    )
                 renewed.pending_upload = True
                 renewed.last_error = None
                 self.store.upsert(renewed)
@@ -566,6 +590,215 @@ class TokenPoolApp:
         )
         self.root.after(1500, self._scheduler_tick)
 
+    def _client_control_status(self) -> dict[str, object]:
+        accounts = self.store.load()
+        state = getattr(self, "automation_state", None)
+        return {
+            "busy": bool(getattr(self, "busy", False)),
+            "last_work_refresh_result": str(
+                getattr(state, "last_work_refresh_result", "") or ""
+            ),
+            "pending_work_refresh_slot": str(
+                getattr(state, "pending_work_refresh_slot", "") or ""
+            ),
+            "accounts": [
+                {
+                    "account_id": account.account_id,
+                    "authorization_expires_at": _authorization_expires_at(account),
+                    "access_expires_at": account.access_expires_at,
+                    "last_uploaded_at": account.last_uploaded_at,
+                    "pending_upload": account.pending_upload,
+                    "status": _account_status(account),
+                }
+                for account in accounts
+            ],
+        }
+
+    def _poll_admin_control(self) -> None:
+        if self.control_polling or self.busy or not self.config:
+            return
+        self.control_polling = True
+        config = self.config
+        accounts = self.store.load()
+
+        def work() -> None:
+            response: dict[str, object] | None = None
+            failure: BaseException | None = None
+            try:
+                flush_admin_command_results(config)
+                response = poll_admin_commands(
+                    config,
+                    account_ids=[account.account_id for account in accounts],
+                    status=self._client_control_status(),
+                )
+            except BaseException as exc:
+                failure = exc
+
+            def completed() -> None:
+                self.control_polling = False
+                if failure is not None:
+                    self.next_control_poll = time.monotonic() + 120
+                    return
+                value = response or {}
+                supported = value.get("supported", True) is not False
+                try:
+                    interval = int(value.get("poll_after_seconds") or (60 if supported else 300))
+                except (TypeError, ValueError):
+                    interval = 60
+                self.next_control_poll = time.monotonic() + min(max(interval, 30), 300)
+                command = value.get("command")
+                if isinstance(command, dict):
+                    self._execute_admin_command(command)
+
+            if not self.shutting_down:
+                self.root.after(0, completed)
+
+        threading.Thread(target=work, name="token-pool-admin-poll", daemon=True).start()
+
+    def _execute_admin_command(self, command: dict[str, object]) -> None:
+        command_id = str(command.get("command_id") or "")
+        command_name = str(command.get("command") or "")
+        payload_value = command.get("payload")
+        payload = payload_value if isinstance(payload_value, dict) else {}
+        if len(command_id) != 32:
+            return
+        if command_name == "force_renew":
+            requested_ids = payload.get("account_ids")
+            selected_ids = (
+                {str(value) for value in requested_ids}
+                if isinstance(requested_ids, list) and requested_ids
+                else None
+            )
+            accounts = [
+                account
+                for account in self.store.load()
+                if is_automatic_work_account(account.username)
+                and (selected_ids is None or account.account_id in selected_ids)
+            ]
+            if not accounts:
+                self._finish_admin_command(
+                    command_id,
+                    succeeded=False,
+                    result={"error": "No matching automatic work account is configured."},
+                )
+                return
+            allow_visible = payload.get("interaction") == "allow_visible"
+            if allow_visible:
+                self.tray.notify(
+                    "Administrator requested token renewal",
+                    "Microsoft Edge may open if sign-in or MFA is required.",
+                )
+
+            def completed(result: object | None, failure: BaseException | None) -> None:
+                batch = (
+                    result
+                    if isinstance(result, RenewalBatchResult)
+                    else RenewalBatchResult(permanent_failures=len(accounts))
+                )
+                succeeded = failure is None and batch.failures == 0 and batch.successes > 0
+                self._finish_admin_command(
+                    command_id,
+                    succeeded=succeeded,
+                    result={
+                        "successes": batch.successes,
+                        "permanent_failures": batch.permanent_failures,
+                        "transient_failures": batch.transient_failures,
+                        "interaction": "allow_visible" if allow_visible else "silent_only",
+                        "error": str(failure)[:500] if failure else None,
+                    },
+                )
+
+            started = self._background(
+                "Administrator-requested renewal...",
+                lambda: self._renew_and_upload(
+                    accounts,
+                    automatic=True,
+                    client_event="admin_force_renew",
+                    allow_visible=allow_visible,
+                ),
+                on_complete=completed,
+                show_error=False,
+            )
+            if not started:
+                self._finish_admin_command(
+                    command_id,
+                    succeeded=False,
+                    result={"error": "Client was already busy."},
+                )
+            return
+
+        if command_name == "force_update":
+            def update_work() -> dict[str, object]:
+                changed, before, after = check_for_update(self.store.root)
+                result = {"changed": changed, "before": before, "after": after}
+                queue_admin_command_result(
+                    command_id=command_id,
+                    succeeded=True,
+                    result=result,
+                )
+                flush_admin_command_results(self.config)
+                return result
+
+            def update_completed(result: object | None, failure: BaseException | None) -> None:
+                if failure is not None:
+                    self._finish_admin_command(
+                        command_id,
+                        succeeded=False,
+                        result={"error": str(failure)[:500]},
+                    )
+                    return
+                value = result if isinstance(result, dict) else {}
+                if value.get("changed"):
+                    self.log(
+                        f"Administrator update installed {value.get('after')}; restarting in the notification area..."
+                    )
+                    try:
+                        restart_after_exit(self.store.root)
+                    except Exception as exc:
+                        self.log(f"Could not restart after administrator update: {exc}")
+                        return
+                    self.root.after(0, self.shutdown)
+
+            started = self._background(
+                "Administrator-requested update...",
+                update_work,
+                on_complete=update_completed,
+                show_error=False,
+            )
+            if not started:
+                self._finish_admin_command(
+                    command_id,
+                    succeeded=False,
+                    result={"error": "Client was already busy."},
+                )
+            return
+
+        self._finish_admin_command(
+            command_id,
+            succeeded=False,
+            result={"error": f"Unsupported command: {command_name}"},
+        )
+
+    def _finish_admin_command(
+        self,
+        command_id: str,
+        *,
+        succeeded: bool,
+        result: dict[str, object],
+    ) -> None:
+        queue_admin_command_result(
+            command_id=command_id,
+            succeeded=succeeded,
+            result=result,
+        )
+        self.next_control_poll = time.monotonic() + 5
+
+        def send() -> None:
+            if self.config:
+                flush_admin_command_results(self.config)
+
+        threading.Thread(target=send, name="token-pool-admin-result", daemon=True).start()
+
     def _scheduler_tick(self) -> None:
         if self.shutting_down:
             return
@@ -648,7 +881,17 @@ class TokenPoolApp:
                     show_error=False,
                 )
 
-        if time.monotonic() >= self.next_update_check and not self.busy:
+        if (
+            time.monotonic() >= getattr(self, "next_control_poll", float("inf"))
+            and not self.busy
+            and not getattr(self, "control_polling", False)
+        ):
+            self._poll_admin_control()
+        if (
+            time.monotonic() >= self.next_update_check
+            and not self.busy
+            and not getattr(self, "control_polling", False)
+        ):
             self.check_updates(manual=False)
         poll_seconds = max(2, int(os.getenv("TOKEN_POOL_SCHEDULER_POLL_SECONDS", "30")))
         self.root.after(poll_seconds * 1000, self._scheduler_tick)

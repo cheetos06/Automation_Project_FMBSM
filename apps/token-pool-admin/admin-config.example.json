@@ -1,0 +1,5 @@
+{
+  "endpoint": "https://35.180.210.11",
+  "admin_key": "replace-with-a-dedicated-random-admin-key",
+  "ca_certificate": "server.crt"
+}
