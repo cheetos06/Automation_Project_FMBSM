@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from dotenv import load_dotenv
 
 from .admin_ping import CopilotPingManager
@@ -38,7 +39,7 @@ from .upload_validation import MicrosoftSessionValidator, SessionProofUnavailabl
 
 
 LOGGER = logging.getLogger("copilot-token-api")
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.1.1"
 TOKEN_CLIENT_DOWNLOAD_PREFIX = "/downloads/token-client/"
 TOKEN_CLIENT_TAG = re.compile(r"token-client-v[0-9]+\.[0-9]+\.[0-9]+(?:[-A-Za-z0-9.]*)?\Z")
 TOKEN_CLIENT_ASSET = re.compile(
@@ -50,6 +51,7 @@ TOKEN_CLIENT_ASSET = re.compile(
 )
 MAX_CLIENT_EVENT_BYTES = 4096
 MAX_CONTROL_BODY_BYTES = 32768
+ADMIN_ENVELOPE_CONTENT_TYPE = "application/vnd.fmbsm.admin+aesgcm"
 CLIENT_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 CLIENT_EVENT_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,47}\Z")
 CLIENT_ACCOUNT_ID_PATTERN = re.compile(r"account-[A-Za-z0-9._-]{1,80}\Z")
@@ -131,6 +133,7 @@ class TokenApiHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:  # noqa: N802
+        self._admin_response_nonce = ""
         path = urlsplit(self.path).path.rstrip("/") or "/"
         if self._serve_token_client_artifact(path, head_only=False):
             return
@@ -169,6 +172,7 @@ class TokenApiHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        self._admin_response_nonce = ""
         path = urlsplit(self.path).path.rstrip("/")
         if path == "/v1/client-events":
             self._receive_client_event()
@@ -433,11 +437,8 @@ class TokenApiHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, {"ok": True, "command_id": command_id})
 
     def _admin_snapshot(self) -> None:
-        parsed = self._read_json_body(MAX_CONTROL_BODY_BYTES)
-        if parsed is None:
-            return
-        body, _payload = parsed
-        if not self._admin_authenticated(body):
+        payload = self._read_admin_body()
+        if payload is None:
             return
         registry = self.server.registry
         now = time.time()
@@ -508,11 +509,8 @@ class TokenApiHandler(BaseHTTPRequestHandler):
         )
 
     def _admin_create_commands(self) -> None:
-        parsed = self._read_json_body(MAX_CONTROL_BODY_BYTES)
-        if parsed is None:
-            return
-        body, payload = parsed
-        if not self._admin_authenticated(body):
+        payload = self._read_admin_body()
+        if payload is None:
             return
         raw_client_ids = payload.get("client_ids")
         client_ids = (
@@ -568,11 +566,8 @@ class TokenApiHandler(BaseHTTPRequestHandler):
         )
 
     def _admin_cancel_command(self) -> None:
-        parsed = self._read_json_body(MAX_CONTROL_BODY_BYTES)
-        if parsed is None:
-            return
-        body, payload = parsed
-        if not self._admin_authenticated(body):
+        payload = self._read_admin_body()
+        if payload is None:
             return
         command_id = str(payload.get("command_id") or "").lower()
         if not re.fullmatch(r"[0-9a-f]{32}", command_id):
@@ -582,11 +577,8 @@ class TokenApiHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, {"ok": True, "cancelled": cancelled})
 
     def _admin_start_copilot_test(self) -> None:
-        parsed = self._read_json_body(MAX_CONTROL_BODY_BYTES)
-        if parsed is None:
-            return
-        body, payload = parsed
-        if not self._admin_authenticated(body):
+        payload = self._read_admin_body()
+        if payload is None:
             return
         raw_account_ids = payload.get("account_ids")
         account_ids = (
@@ -615,6 +607,43 @@ class TokenApiHandler(BaseHTTPRequestHandler):
             )
             return
         self._json(HTTPStatus.ACCEPTED, {"ok": True, "job": job})
+
+    def _read_admin_body(self) -> dict[str, Any] | None:
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._json(HTTPStatus.LENGTH_REQUIRED, {"ok": False, "error": "invalid_content_length"})
+            return None
+        if length < 12 + 16 or length > MAX_CONTROL_BODY_BYTES:
+            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"ok": False, "error": "request_too_large"})
+            return None
+        self.connection.settimeout(15)
+        body = self.rfile.read(length)
+        if len(body) != length:
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "incomplete_body"})
+            return None
+        if not self._admin_authenticated(body):
+            return None
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != ADMIN_ENVELOPE_CONTENT_TYPE:
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "admin_encryption_required"})
+            return None
+        nonce, ciphertext = body[:12], body[12:]
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        try:
+            plaintext = AESGCM(_admin_encryption_key(self.server.admin_key)).decrypt(
+                nonce,
+                ciphertext,
+                f"request\n{self.command.upper()}\n{path}".encode("utf-8"),
+            )
+            payload = json.loads(plaintext.decode("utf-8"))
+        except Exception:
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_admin_envelope"})
+            return None
+        if not isinstance(payload, dict):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json_object"})
+            return None
+        return payload
 
     def _read_json_body(self, maximum_bytes: int) -> tuple[bytes, dict[str, Any]] | None:
         try:
@@ -681,6 +710,7 @@ class TokenApiHandler(BaseHTTPRequestHandler):
         }
 
     def do_HEAD(self) -> None:  # noqa: N802
+        self._admin_response_nonce = ""
         path = urlsplit(self.path).path.rstrip("/") or "/"
         if self._serve_token_client_artifact(path, head_only=True):
             return
@@ -775,15 +805,6 @@ class TokenApiHandler(BaseHTTPRequestHandler):
         return True
 
     def _admin_authenticated(self, body: bytes) -> bool:
-        if (
-            not isinstance(self.connection, ssl.SSLSocket)
-            and self.client_address[0] not in {"127.0.0.1", "::1"}
-        ):
-            self._json(
-                HTTPStatus.UPGRADE_REQUIRED,
-                {"ok": False, "error": "admin_https_required"},
-            )
-            return False
         if len(self.server.admin_key) < 32:
             self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False, "error": "admin_api_disabled"})
             return False
@@ -817,14 +838,28 @@ class TokenApiHandler(BaseHTTPRequestHandler):
                 hashlib.sha256,
             ).hexdigest()
             if hmac.compare_digest(signature.lower(), expected) and self.server.consume_nonce(nonce, timestamp):
+                self._admin_response_nonce = nonce
                 return True
         self._json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "admin_unauthorized"})
         return False
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
-        body = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        plaintext = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        response_nonce = getattr(self, "_admin_response_nonce", "")
+        if response_nonce:
+            path = urlsplit(self.path).path.rstrip("/") or "/"
+            nonce = os.urandom(12)
+            body = nonce + AESGCM(_admin_encryption_key(self.server.admin_key)).encrypt(
+                nonce,
+                plaintext,
+                f"response\n{int(status)}\n{path}\n{response_nonce}".encode("utf-8"),
+            )
+            content_type = ADMIN_ENVELOPE_CONTENT_TYPE
+        else:
+            body = plaintext
+            content_type = "application/json; charset=utf-8"
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -898,6 +933,12 @@ def _server_metrics(process_started_at: float) -> dict[str, Any]:
         "disk": disk_value,
         "services": services,
     }
+
+
+def _admin_encryption_key(admin_key: str) -> bytes:
+    return hashlib.sha256(
+        b"fmbsm-admin-envelope-v1\0" + admin_key.encode("utf-8")
+    ).digest()
 
 
 def _load_environment() -> Path:

@@ -1,5 +1,5 @@
 param(
-    [string]$Endpoint = "https://35.180.210.11",
+    [string]$Endpoint = "http://35.180.210.11",
     [string]$CertificatePath = "",
     [switch]$Force
 )
@@ -19,8 +19,11 @@ if (-not $CertificatePath) {
 if (-not (Test-Path -LiteralPath $CertificatePath)) {
     throw "Pinned token server certificate was not found: $CertificatePath"
 }
-if (-not $Endpoint.StartsWith("https://", [StringComparison]::OrdinalIgnoreCase)) {
-    throw "The remote administrator API must use HTTPS."
+if (-not (
+    $Endpoint.StartsWith("http://", [StringComparison]::OrdinalIgnoreCase) -or
+    $Endpoint.StartsWith("https://", [StringComparison]::OrdinalIgnoreCase)
+)) {
+    throw "The administrator API endpoint must use HTTP or HTTPS."
 }
 
 $KeyBytes = New-Object byte[] 32

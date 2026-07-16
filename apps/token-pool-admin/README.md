@@ -4,6 +4,10 @@ Private Windows control center for the FMBSM desktop token contributors and AWS 
 
 The administrator app is a separate executable from Token Pool Client. It is not included in the public colleague package and uses a dedicated `TOKEN_ADMIN_KEY` that must never be committed or bundled with the normal client.
 
+Administrator request and response bodies use AES-GCM application encryption and
+HMAC authentication. This remains confidential and tamper-resistant when a company
+proxy only permits the AWS HTTP listener; HTTPS can still be selected where available.
+
 Features:
 
 - live online/offline client presence and installed versions;

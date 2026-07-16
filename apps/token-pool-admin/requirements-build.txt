@@ -1,4 +1,5 @@
 altgraph==0.17.5
+cryptography==47.0.0
 packaging==26.2
 pefile==2024.8.26
 pyinstaller==6.21.0
