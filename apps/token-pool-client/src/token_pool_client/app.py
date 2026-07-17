@@ -717,6 +717,9 @@ class TokenPoolApp:
                 except (TypeError, ValueError):
                     interval = 60
                 self.next_control_poll = time.monotonic() + min(max(interval, 30), 300)
+                client_status = value.get("client_status")
+                if isinstance(client_status, dict):
+                    self._reconcile_ready_server_accounts(client_status)
                 command = value.get("command")
                 if isinstance(command, dict):
                     self._execute_admin_command(command)
@@ -725,6 +728,37 @@ class TokenPoolApp:
                 self.root.after(0, completed)
 
         threading.Thread(target=work, name="token-pool-admin-poll", daemon=True).start()
+
+    def _reconcile_ready_server_accounts(self, client_status: dict[str, object]) -> None:
+        """Clear a stale MFA upload error when AWS still has a working session."""
+
+        raw_accounts = client_status.get("accounts")
+        if not isinstance(raw_accounts, list):
+            return
+        ready_ids = {
+            str(item.get("account_id") or "")
+            for item in raw_accounts
+            if isinstance(item, dict) and item.get("ready")
+        }
+        if not ready_ids:
+            return
+        changed = False
+        for account in self.store.load():
+            error = str(account.last_error or "")
+            if (
+                account.account_id in ready_ids
+                and not account.pending_upload
+                and "AADSTS50078" in error
+                and "interactive_mfa" in error
+            ):
+                account.last_error = None
+                self.store.upsert(account)
+                self.log(
+                    f"AWS confirms {account.username} is still ready; cleared the stale rejected-retry warning."
+                )
+                changed = True
+        if changed:
+            self._refresh_table()
 
     def _execute_admin_command(self, command: dict[str, object]) -> None:
         command_id = str(command.get("command_id") or "")
@@ -877,10 +911,34 @@ class TokenPoolApp:
         due = latest_due_slot(now, self.refresh_times)
         if due is not None:
             key = slot_key(due)
-            accounts = [item for item in self.store.load() if is_automatic_work_account(item.username)]
+            work_accounts = [
+                item for item in self.store.load() if is_automatic_work_account(item.username)
+            ]
+            accounts = [
+                item
+                for item in work_accounts
+                if float(item.last_uploaded_at or 0) < due.timestamp()
+            ]
             pending_this_slot = self.automation_state.pending_work_refresh_slot == key
             retry_due = pending_this_slot and _retry_is_due(self.automation_state.next_work_retry_at, now)
             new_slot = key != self.automation_state.last_work_refresh_slot and not pending_this_slot
+            stale_failed_result = (
+                self.automation_state.last_work_refresh_slot == key
+                and self.automation_state.last_work_refresh_result.startswith("failed:")
+            )
+            if work_accounts and not accounts and (
+                new_slot or pending_this_slot or stale_failed_result
+            ):
+                self.automation_state.last_work_refresh_slot = key
+                self.automation_state.pending_work_refresh_slot = ""
+                self.automation_state.next_work_retry_at = ""
+                self.automation_state.work_retry_count = 0
+                self.automation_state.last_work_refresh_result = "satisfied_by_recent_upload"
+                self.automation_state.save()
+                self.log(
+                    f"Scheduled slot {key} already satisfied by a newer successful AWS upload; "
+                    "no second Microsoft renewal was started."
+                )
             if accounts and (new_slot or retry_due) and not self.busy:
                 if new_slot:
                     self.automation_state.work_retry_count = 0

@@ -269,6 +269,10 @@ class RegistryTests(unittest.TestCase):
                         account_ids=["account-test"],
                         status={"busy": False},
                     )
+                    self.assertEqual(
+                        polled["client_status"]["accounts"][0]["account_id"],
+                        "account-test",
+                    )
                     command = polled["command"]
                     self.assertEqual(command["command"], "force_renew")
                     self.assertEqual(command["payload"]["interaction"], "silent_only")

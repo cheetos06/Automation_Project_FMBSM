@@ -296,6 +296,80 @@ class ClientBundleTests(unittest.TestCase):
             self.assertEqual(app.automation_state.pending_work_refresh_slot, "")
             self.assertEqual(app.automation_state.last_work_refresh_result, "success:1")
 
+    def test_successful_upload_after_due_slot_prevents_redundant_renewal(self) -> None:
+        now = datetime.now().astimezone()
+        due_time = now.strftime("%H:%M")
+        due = latest_due_slot(now, (due_time,))
+        self.assertIsNotNone(due)
+        account = ClientAccount(
+            account_id="account-test",
+            username="tester@mazars.fr",
+            tenant_id="tenant",
+            object_id="object",
+            session_dir="session",
+            profile_dir="profile",
+            access_expires_at=now.timestamp() + 3600,
+            last_uploaded_at=now.timestamp(),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            app = TokenPoolApp.__new__(TokenPoolApp)
+            app.shutting_down = False
+            app.refresh_times = (due_time,)
+            app.store = MagicMock()
+            app.store.load.return_value = [account]
+            app.automation_state = AutomationState(path=Path(temporary) / "automation-state.json")
+            app.busy = False
+            app.next_update_check = float("inf")
+            app.root = MagicMock()
+            app.log = MagicMock()
+            app._background = MagicMock()
+
+            app._scheduler_tick()
+
+            app._background.assert_not_called()
+            self.assertEqual(app.automation_state.last_work_refresh_slot, slot_key(due))
+            self.assertEqual(
+                app.automation_state.last_work_refresh_result,
+                "satisfied_by_recent_upload",
+            )
+            self.assertEqual(app.automation_state.pending_work_refresh_slot, "")
+
+            app.automation_state.last_work_refresh_result = "failed:1"
+            app.automation_state.save()
+            app._scheduler_tick()
+            self.assertEqual(
+                app.automation_state.last_work_refresh_result,
+                "satisfied_by_recent_upload",
+            )
+
+    def test_ready_aws_session_clears_stale_rejected_retry_warning(self) -> None:
+        account = ClientAccount(
+            account_id="account-test",
+            username="tester@mazars.fr",
+            tenant_id="tenant",
+            object_id="object",
+            session_dir="session",
+            profile_dir="profile",
+            access_expires_at=9999999999,
+            last_error=(
+                "Server rejected the request: {'microsoft_error_code': 'AADSTS50078', "
+                "'action': 'interactive_mfa_'}"
+            ),
+        )
+        app = TokenPoolApp.__new__(TokenPoolApp)
+        app.store = MagicMock()
+        app.store.load.return_value = [account]
+        app.log = MagicMock()
+        app._refresh_table = MagicMock()
+
+        app._reconcile_ready_server_accounts(
+            {"accounts": [{"account_id": "account-test", "ready": True}]}
+        )
+
+        self.assertIsNone(account.last_error)
+        app.store.upsert.assert_called_once_with(account)
+        app._refresh_table.assert_called_once_with()
+
     def test_scheduler_stops_after_two_delayed_network_retries(self) -> None:
         now = datetime.now().astimezone()
         due_time = now.strftime("%H:%M")

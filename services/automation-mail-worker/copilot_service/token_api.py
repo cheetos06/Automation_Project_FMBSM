@@ -39,7 +39,7 @@ from .upload_validation import MicrosoftSessionRejected, MicrosoftSessionValidat
 
 
 LOGGER = logging.getLogger("copilot-token-api")
-SERVER_VERSION = "1.4.0"
+SERVER_VERSION = "1.5.0"
 TOKEN_CLIENT_DOWNLOAD_PREFIX = "/downloads/token-client/"
 TOKEN_CLIENT_TAG = re.compile(r"token-client-v[0-9]+\.[0-9]+\.[0-9]+(?:[-A-Za-z0-9.]*)?\Z")
 TOKEN_CLIENT_ASSET = re.compile(
@@ -464,6 +464,10 @@ class TokenApiHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "server_time": time.time(),
                 "poll_after_seconds": 60,
+                "client_status": _client_status_payload(
+                    self.server.registry,
+                    presence["account_ids"],
+                ),
                 "command": command,
             },
         )
