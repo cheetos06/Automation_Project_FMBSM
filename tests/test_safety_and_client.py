@@ -500,6 +500,30 @@ class ClientBundleTests(unittest.TestCase):
         self.assertEqual(result.transient_failures, 1)
         app._fresh_renewal.assert_not_called()
 
+    def test_starting_background_work_immediately_requests_busy_presence(self) -> None:
+        app = TokenPoolApp.__new__(TokenPoolApp)
+        app.busy = False
+        app.current_activity = "Ready"
+        app.next_presence_heartbeat = 999.0
+        app.next_control_poll = 999.0
+        app.refresh_button = MagicMock()
+        app.add_button = MagicMock()
+        app.status_button = MagicMock()
+        app.state_label = MagicMock()
+        app._send_busy_heartbeat = MagicMock()
+
+        app._set_busy(True, "Adding Microsoft account...")
+
+        self.assertTrue(app.busy)
+        self.assertEqual(app.current_activity, "Adding Microsoft account...")
+        self.assertEqual(app.next_presence_heartbeat, 0.0)
+        app._send_busy_heartbeat.assert_called_once_with()
+
+        app._set_busy(False)
+        self.assertFalse(app.busy)
+        self.assertEqual(app.current_activity, "Ready")
+        self.assertEqual(app.next_control_poll, 0.0)
+
     def test_network_failure_after_renewal_preserves_pending_upload_without_token_error(self) -> None:
         account = ClientAccount(
             account_id="account-test",

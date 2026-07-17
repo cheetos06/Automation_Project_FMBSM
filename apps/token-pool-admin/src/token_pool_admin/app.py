@@ -11,7 +11,7 @@ from tkinter import messagebox, ttk
 from typing import Any, Callable
 
 from . import __version__
-from .api import cancel_command, create_commands, snapshot, start_copilot_test
+from .api import cancel_command, create_commands, forget_clients, snapshot, start_copilot_test
 from .storage import AdminConfig, executable_dir, load_config
 
 
@@ -171,7 +171,12 @@ class TokenPoolAdminApp:
         ttk.Button(bar, text="Force renewal", style="Primary.TButton", command=self.force_renew).pack(side="left", padx=4)
         ttk.Button(bar, text="Force update check", command=self.force_update).pack(side="left", padx=4)
         ttk.Button(bar, text="Copy diagnostics", command=self.copy_client_diagnostics).pack(side="left", padx=4)
-        ttk.Label(bar, text="Select one or multiple online clients", foreground=MUTED).pack(side="right")
+        ttk.Button(
+            bar,
+            text="Forget offline unmapped",
+            style="Danger.TButton",
+            command=self.forget_selected_clients,
+        ).pack(side="left", padx=4)
 
         columns = ("online", "accounts", "version", "last_seen", "activity", "token", "commands")
         self.clients_tree = self._tree(
@@ -398,7 +403,11 @@ class TokenPoolAdminApp:
                 if isinstance(item, dict)
             ) or "Waiting for client details"
             online = bool(client.get("online"))
-            activity = "Busy" if status.get("busy") else str(client.get("last_event") or "Idle").replace("_", " ").title()
+            activity = (
+                str(status.get("activity") or "Busy")
+                if status.get("busy")
+                else str(client.get("last_event") or "Idle").replace("_", " ").title()
+            )
             iid = "client-" + client_id
             self.clients_tree.insert(
                 "",
@@ -603,6 +612,39 @@ class TokenPoolAdminApp:
                 expires_in_seconds=30 * 60,
             ),
             "Update command queued",
+        )
+
+    def forget_selected_clients(self) -> None:
+        clients = self._selected_clients()
+        if not clients:
+            messagebox.showinfo("Select clients", "Select at least one offline unmapped installation.")
+            return
+        if any(client.get("online") for client in clients):
+            messagebox.showwarning(
+                "Online selection",
+                "Only offline installations can be forgotten. Remove online clients from the selection.",
+            )
+            return
+        if any(client.get("account_ids") for client in clients):
+            messagebox.showwarning(
+                "Mapped selection",
+                "Only installations with no mapped Microsoft accounts can be forgotten.",
+            )
+            return
+        short_ids = ", ".join(str(client.get("client_id") or "")[:8] for client in clients)
+        if not messagebox.askyesno(
+            "Forget selected installations?",
+            "Remove the selected abandoned installation records from the admin view?\n\n"
+            f"Clients: {short_ids}\n\n"
+            "This does not uninstall anything and does not affect Copilot accounts.",
+        ):
+            return
+        self._run_action(
+            lambda: forget_clients(
+                self.config,
+                [str(client["client_id"]) for client in clients],
+            ),
+            "Selected installation records forgotten",
         )
 
     def ping_selected(self) -> None:

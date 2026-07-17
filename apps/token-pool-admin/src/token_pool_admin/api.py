@@ -55,6 +55,10 @@ def cancel_command(config: AdminConfig, command_id: str) -> dict[str, Any]:
     return _post(config, "/v1/admin/commands/cancel", {"command_id": command_id})
 
 
+def forget_clients(config: AdminConfig, client_ids: list[str]) -> dict[str, Any]:
+    return _post(config, "/v1/admin/clients/forget", {"client_ids": client_ids})
+
+
 def start_copilot_test(config: AdminConfig, account_ids: list[str]) -> dict[str, Any]:
     return _post(config, "/v1/admin/copilot-tests", {"account_ids": account_ids}, timeout=20)
 

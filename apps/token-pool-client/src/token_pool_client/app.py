@@ -34,6 +34,7 @@ from .control import (
     flush_admin_command_results,
     poll_admin_commands,
     queue_admin_command_result,
+    send_client_heartbeat,
 )
 from .refresh import initialize_refresh, refresh_existing
 from .storage import AccountStore, ClientAccount
@@ -78,6 +79,7 @@ class TokenPoolApp:
         self.store = AccountStore()
         self.config: ClientConfig | None = None
         self.busy = False
+        self.current_activity = "Ready"
         self.shutting_down = False
         self.refresh_times = configured_refresh_times()
         self.update_interval = update_interval_seconds()
@@ -85,6 +87,8 @@ class TokenPoolApp:
         self.next_update_check = time.monotonic() + self.update_interval
         self.next_control_poll = time.monotonic() + 5
         self.control_polling = False
+        self.next_presence_heartbeat = 0.0
+        self.presence_heartbeat_running = False
         self.log_path = self.store.root / "client.log"
         self.log_lock = threading.Lock()
         self.root.title(f"FMBSM Token Pool Client {__version__}")
@@ -253,10 +257,16 @@ class TokenPoolApp:
 
     def _set_busy(self, busy: bool, text: str = "Ready") -> None:
         self.busy = busy
+        self.current_activity = text if busy else "Ready"
         state = "disabled" if busy else "normal"
         for button in (self.refresh_button, self.add_button, self.status_button):
             button.configure(state=state)
         self.state_label.configure(text=text)
+        if busy:
+            self.next_presence_heartbeat = 0.0
+            self._send_busy_heartbeat()
+        else:
+            self.next_control_poll = 0.0
 
     def _background(
         self,
@@ -618,6 +628,7 @@ class TokenPoolApp:
         state = getattr(self, "automation_state", None)
         return {
             "busy": bool(getattr(self, "busy", False)),
+            "activity": str(getattr(self, "current_activity", "Ready") or "Ready")[:120],
             "last_work_refresh_result": str(
                 getattr(state, "last_work_refresh_result", "") or ""
             ),
@@ -636,6 +647,43 @@ class TokenPoolApp:
                 for account in accounts
             ],
         }
+
+    def _send_busy_heartbeat(self) -> None:
+        """Keep long Microsoft sign-in/onboarding operations visible as online."""
+
+        if (
+            not self.busy
+            or self.shutting_down
+            or not self.config
+            or self.presence_heartbeat_running
+        ):
+            return
+        self.presence_heartbeat_running = True
+        self.next_presence_heartbeat = time.monotonic() + 45
+        config = self.config
+        accounts = self.store.load()
+
+        def work() -> None:
+            succeeded = False
+            try:
+                send_client_heartbeat(
+                    config,
+                    account_ids=[account.account_id for account in accounts],
+                    status=self._client_control_status(),
+                )
+                succeeded = True
+            except Exception:
+                # Presence is best-effort and must never interrupt Microsoft sign-in.
+                pass
+
+            def completed() -> None:
+                self.presence_heartbeat_running = False
+                self.next_presence_heartbeat = time.monotonic() + (45 if succeeded else 90)
+
+            if not self.shutting_down:
+                self.root.after(0, completed)
+
+        threading.Thread(target=work, name="token-pool-presence", daemon=True).start()
 
     def _poll_admin_control(self) -> None:
         if self.control_polling or self.busy or not self.config:
@@ -904,6 +952,12 @@ class TokenPoolApp:
                     show_error=False,
                 )
 
+        if (
+            self.busy
+            and time.monotonic() >= getattr(self, "next_presence_heartbeat", 0.0)
+            and not getattr(self, "presence_heartbeat_running", False)
+        ):
+            self._send_busy_heartbeat()
         if (
             time.monotonic() >= getattr(self, "next_control_poll", float("inf"))
             and not self.busy

@@ -37,6 +37,29 @@ def poll_admin_commands(
         raise
 
 
+def send_client_heartbeat(
+    config: ClientConfig,
+    *,
+    account_ids: list[str],
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    """Refresh client presence without leasing an administrator command."""
+
+    payload = {
+        "client_id": _client_installation_id(),
+        "observed_at": time.time(),
+        "app_version": __version__,
+        "account_ids": list(dict.fromkeys(account_ids)),
+        "status": status,
+    }
+    try:
+        return _signed_json_post(config, "/v1/client/status", payload, timeout_seconds=8)
+    except ServerRejectedError as exc:
+        if exc.status_code == 404 and exc.detail.get("error") == "not_found":
+            return {"ok": True, "supported": False}
+        raise
+
+
 def complete_admin_command(
     config: ClientConfig,
     *,

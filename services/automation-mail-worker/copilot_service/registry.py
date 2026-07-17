@@ -420,6 +420,33 @@ class CopilotRegistry:
             )
         return result
 
+    def forget_unmapped_client(
+        self,
+        client_id: str,
+        *,
+        offline_before: float,
+    ) -> tuple[bool, str]:
+        """Remove one explicitly selected stale installation and its telemetry.
+
+        The checks and deletion share one write transaction so a fresh heartbeat
+        or newly mapped account cannot race an administrator's deletion request.
+        """
+
+        with self._connect(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT last_seen_at, account_ids FROM clients WHERE client_id=?",
+                (client_id,),
+            ).fetchone()
+            if row is None:
+                return False, "unknown_client"
+            if float(row["last_seen_at"]) >= float(offline_before):
+                return False, "client_online"
+            if any(value for value in str(row["account_ids"] or "").split(",") if value):
+                return False, "client_has_accounts"
+            connection.execute("DELETE FROM client_events WHERE client_id=?", (client_id,))
+            connection.execute("DELETE FROM clients WHERE client_id=?", (client_id,))
+        return True, "forgotten"
+
     def create_client_command(
         self,
         *,

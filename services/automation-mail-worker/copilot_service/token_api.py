@@ -39,7 +39,7 @@ from .upload_validation import MicrosoftSessionRejected, MicrosoftSessionValidat
 
 
 LOGGER = logging.getLogger("copilot-token-api")
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "1.4.0"
 TOKEN_CLIENT_DOWNLOAD_PREFIX = "/downloads/token-client/"
 TOKEN_CLIENT_TAG = re.compile(r"token-client-v[0-9]+\.[0-9]+\.[0-9]+(?:[-A-Za-z0-9.]*)?\Z")
 TOKEN_CLIENT_ASSET = re.compile(
@@ -199,6 +199,9 @@ class TokenApiHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/admin/commands/cancel":
             self._admin_cancel_command()
+            return
+        if path == "/v1/admin/clients/forget":
+            self._admin_forget_clients()
             return
         if path == "/v1/admin/copilot-tests":
             self._admin_start_copilot_test()
@@ -641,6 +644,39 @@ class TokenApiHandler(BaseHTTPRequestHandler):
             return
         cancelled = self.server.registry.cancel_client_command(command_id)
         self._json(HTTPStatus.OK, {"ok": True, "cancelled": cancelled})
+
+    def _admin_forget_clients(self) -> None:
+        payload = self._read_admin_body()
+        if payload is None:
+            return
+        raw_client_ids = payload.get("client_ids")
+        client_ids = (
+            list(dict.fromkeys(str(value).lower() for value in raw_client_ids))
+            if isinstance(raw_client_ids, list)
+            else []
+        )
+        if not (
+            1 <= len(client_ids) <= 20
+            and all(CLIENT_ID_PATTERN.fullmatch(value) for value in client_ids)
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_client_selection"})
+            return
+        offline_before = time.time() - 150
+        forgotten: list[str] = []
+        rejected: list[dict[str, str]] = []
+        for client_id in client_ids:
+            removed, reason = self.server.registry.forget_unmapped_client(
+                client_id,
+                offline_before=offline_before,
+            )
+            if removed:
+                forgotten.append(client_id)
+            else:
+                rejected.append({"client_id": client_id, "reason": reason})
+        self._json(
+            HTTPStatus.OK,
+            {"ok": True, "forgotten": forgotten, "rejected": rejected},
+        )
 
     def _admin_start_copilot_test(self) -> None:
         payload = self._read_admin_body()

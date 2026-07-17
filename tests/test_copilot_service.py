@@ -31,10 +31,15 @@ from copilot_service.session_bundle import BundleValidationError, install_bundle
 from copilot_service.token_api import TokenApiServer  # noqa: E402
 from token_pool_client.upload import ClientConfig, client_preflight  # noqa: E402
 from token_pool_client.upload import server_status as client_server_status  # noqa: E402
-from token_pool_client.control import complete_admin_command, poll_admin_commands  # noqa: E402
+from token_pool_client.control import (  # noqa: E402
+    complete_admin_command,
+    poll_admin_commands,
+    send_client_heartbeat,
+)
 from token_pool_admin import api as admin_api  # noqa: E402
 from token_pool_admin.api import AdminApiError  # noqa: E402
 from token_pool_admin.api import create_commands as admin_create_commands  # noqa: E402
+from token_pool_admin.api import forget_clients as admin_forget_clients  # noqa: E402
 from token_pool_admin.api import snapshot as admin_snapshot  # noqa: E402
 from token_pool_admin.storage import AdminConfig  # noqa: E402
 
@@ -231,6 +236,12 @@ class RegistryTests(unittest.TestCase):
                     self.assertEqual(initial["clients"][0]["account_ids"], [])
                     self.assertEqual(initial["clients"][0]["account_usernames"], [])
                     self.assertEqual(initial["pool"]["available_account_count"], 0)
+                    online_rejection = admin_forget_clients(
+                        admin_config,
+                        [initial["clients"][0]["client_id"]],
+                    )
+                    self.assertEqual(online_rejection["forgotten"], [])
+                    self.assertEqual(online_rejection["rejected"][0]["reason"], "client_online")
                     scoped = client_server_status(
                         client_config,
                         account_ids=[expired.account.account_id],
@@ -270,6 +281,35 @@ class RegistryTests(unittest.TestCase):
                     final = admin_snapshot(admin_config)
                     self.assertEqual(final["commands"][0]["status"], "completed")
                     self.assertEqual(final["commands"][0]["result"]["successes"], 1)
+
+                    stale_unmapped_id = "d" * 32
+                    stale_mapped_id = "e" * 32
+                    for stale_id, account_ids in (
+                        (stale_unmapped_id, []),
+                        (stale_mapped_id, [expired.account.account_id]),
+                    ):
+                        registry.update_client_presence(
+                            client_id=stale_id,
+                            observed_at=time.time() - 300,
+                            event="heartbeat",
+                            scheduled_slot=None,
+                            app_version="old-test",
+                            account_ids=account_ids,
+                            remote_address="127.0.0.1",
+                            status={"busy": False},
+                        )
+                    forgotten = admin_forget_clients(admin_config, [stale_unmapped_id])
+                    self.assertEqual(forgotten["forgotten"], [stale_unmapped_id])
+                    self.assertNotIn(
+                        stale_unmapped_id,
+                        {client["client_id"] for client in registry.list_clients()},
+                    )
+                    mapped_rejection = admin_forget_clients(admin_config, [stale_mapped_id])
+                    self.assertEqual(mapped_rejection["forgotten"], [])
+                    self.assertEqual(
+                        mapped_rejection["rejected"][0]["reason"],
+                        "client_has_accounts",
+                    )
             finally:
                 server.shutdown()
                 server.server_close()
@@ -322,6 +362,65 @@ class RegistryTests(unittest.TestCase):
                 self.assertEqual(events[0]["event"], "scheduled_refresh")
                 self.assertEqual(events[0]["account_ids"], ["account-test"])
                 self.assertEqual(events[0]["scheduled_slot"], "2026-07-16T09:45+01:00")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_busy_heartbeat_updates_presence_without_leasing_admin_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry = CopilotRegistry(root / "registry")
+            artifact_root = root / "artifacts"
+            artifact_root.mkdir()
+            server = TokenApiServer(
+                ("127.0.0.1", 0),
+                registry=registry,
+                upload_key="x" * 32,
+                admin_key="a" * 32,
+                status_store=JobStatusStore(root / "job-status"),
+                requests_per_minute=20,
+                transport_private_key=None,
+                session_validator=object(),
+                maximum_accounts=1,
+                artifact_root=artifact_root,
+                artifact_requests_per_hour=10,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            config = ClientConfig(
+                f"http://127.0.0.1:{server.server_port}",
+                "x" * 32,
+                root / "unused-certificate.pem",
+                "repo",
+            )
+            environment = {
+                "TOKEN_POOL_CLIENT_DATA": str(root / "client"),
+                "NO_PROXY": "127.0.0.1,localhost",
+                "no_proxy": "127.0.0.1,localhost",
+            }
+            try:
+                with patch.dict("os.environ", environment):
+                    client_preflight(config, event="startup", account_ids=[])
+                    client_id = registry.list_clients()[0]["client_id"]
+                    command = registry.create_client_command(
+                        client_id=client_id,
+                        command="force_update",
+                        payload={},
+                        expires_in_seconds=600,
+                    )
+                    send_client_heartbeat(
+                        config,
+                        account_ids=[],
+                        status={"busy": True, "activity": "Adding Microsoft account..."},
+                    )
+                client = registry.list_clients()[0]
+                self.assertTrue(client["status"]["busy"])
+                self.assertEqual(client["status"]["activity"], "Adding Microsoft account...")
+                self.assertEqual(
+                    registry.get_client_command(command["command_id"])["status"],
+                    "queued",
+                )
             finally:
                 server.shutdown()
                 server.server_close()
