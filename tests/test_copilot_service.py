@@ -28,7 +28,10 @@ from copilot_service.registry import CopilotRegistry  # noqa: E402
 from copilot_service.admin_ping import CopilotPingManager  # noqa: E402
 from copilot_service.job_status import JobStatusStore  # noqa: E402
 from copilot_service.session_bundle import BundleValidationError, install_bundle  # noqa: E402
-from copilot_service.token_api import TokenApiServer  # noqa: E402
+from copilot_service.token_api import (  # noqa: E402
+    TokenApiServer,
+    _without_registration_race_duplicates,
+)
 from token_pool_client.upload import ClientConfig, client_preflight  # noqa: E402
 from token_pool_client.upload import server_status as client_server_status  # noqa: E402
 from token_pool_client.control import (  # noqa: E402
@@ -95,6 +98,31 @@ def bundle_bytes(
 
 
 class RegistryTests(unittest.TestCase):
+    def test_admin_hides_only_provable_first_run_client_id_alias(self) -> None:
+        shared = {
+            "first_seen_at": 1000.0,
+            "app_version": "1.0.16",
+            "account_ids": ["account-test"],
+            "remote_address": "127.0.0.1",
+        }
+        visible, suppressed = _without_registration_race_duplicates(
+            [
+                {**shared, "client_id": "winner", "last_seen_at": 1060.0},
+                {**shared, "client_id": "alias", "last_seen_at": 1000.0},
+                {
+                    **shared,
+                    "client_id": "real-second-computer",
+                    "first_seen_at": 1001.0,
+                    "last_seen_at": 1001.0,
+                },
+            ]
+        )
+        self.assertEqual(suppressed, 1)
+        self.assertEqual(
+            {client["client_id"] for client in visible},
+            {"winner", "real-second-computer"},
+        )
+
     def test_admin_api_retries_directly_when_configured_proxy_is_dead(self) -> None:
         config = AdminConfig("http://example.invalid", "a" * 32, Path("unused.pem"))
         proxy_opener = MagicMock()
@@ -266,12 +294,12 @@ class RegistryTests(unittest.TestCase):
                     self.assertEqual(len(created["created"]), 1)
                     polled = poll_admin_commands(
                         client_config,
-                        account_ids=["account-test"],
+                        account_ids=[expired.account.account_id],
                         status={"busy": False},
                     )
                     self.assertEqual(
                         polled["client_status"]["accounts"][0]["account_id"],
-                        "account-test",
+                        expired.account.account_id,
                     )
                     command = polled["command"]
                     self.assertEqual(command["command"], "force_renew")
@@ -285,6 +313,14 @@ class RegistryTests(unittest.TestCase):
                     final = admin_snapshot(admin_config)
                     self.assertEqual(final["commands"][0]["status"], "completed")
                     self.assertEqual(final["commands"][0]["result"]["successes"], 1)
+                    self.assertEqual(
+                        final["clients"][0]["server_accounts"][0]["state"],
+                        "renewal_required",
+                    )
+                    self.assertEqual(
+                        final["clients"][0]["server_summary"]["ready_account_count"],
+                        0,
+                    )
 
                     stale_unmapped_id = "d" * 32
                     stale_mapped_id = "e" * 32

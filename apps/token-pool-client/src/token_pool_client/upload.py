@@ -41,6 +41,7 @@ class ServerRejectedError(RuntimeError):
 
 _ROUTE_LOCK = threading.Lock()
 _PROXY_ROUTE_CACHE: dict[str, bool] = {}
+_CLIENT_ID_LOCK = threading.Lock()
 
 
 _TRANSIENT_MARKERS = (
@@ -248,16 +249,35 @@ def client_preflight(
 
 def _client_installation_id() -> str:
     path = application_dir() / "client-id.txt"
-    try:
-        value = uuid.UUID(path.read_text(encoding="ascii").strip()).hex
-        return value
-    except (OSError, ValueError):
-        pass
-    value = uuid.uuid4().hex
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(value + "\n", encoding="ascii")
-    temporary.replace(path)
-    return value
+    # Startup, the tray heartbeat, and the initial server check can arrive on
+    # different threads. Serialize the first read/create so one installation
+    # cannot register two client IDs during its first few seconds.
+    with _CLIENT_ID_LOCK:
+        try:
+            return uuid.UUID(path.read_text(encoding="ascii").strip()).hex
+        except (OSError, ValueError):
+            pass
+
+        value = uuid.uuid4().hex
+        try:
+            # Exclusive creation also protects against two briefly overlapping
+            # app processes (for example startup plus a manual launch).
+            with path.open("x", encoding="ascii") as output:
+                output.write(value + "\n")
+            return value
+        except FileExistsError:
+            # Another process won the create race. Its tiny write may still be
+            # completing, so wait briefly before repairing a corrupt file.
+            for _ in range(20):
+                try:
+                    return uuid.UUID(path.read_text(encoding="ascii").strip()).hex
+                except (OSError, ValueError):
+                    time.sleep(0.01)
+
+            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_text(value + "\n", encoding="ascii")
+            temporary.replace(path)
+            return value
 
 
 def _sign(request: urllib.request.Request, key: str, body: bytes) -> urllib.request.Request:

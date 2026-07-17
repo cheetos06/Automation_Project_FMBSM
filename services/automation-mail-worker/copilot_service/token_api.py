@@ -39,7 +39,7 @@ from .upload_validation import MicrosoftSessionRejected, MicrosoftSessionValidat
 
 
 LOGGER = logging.getLogger("copilot-token-api")
-SERVER_VERSION = "1.5.0"
+SERVER_VERSION = "1.5.1"
 TOKEN_CLIENT_DOWNLOAD_PREFIX = "/downloads/token-client/"
 TOKEN_CLIENT_TAG = re.compile(r"token-client-v[0-9]+\.[0-9]+\.[0-9]+(?:[-A-Za-z0-9.]*)?\Z")
 TOKEN_CLIENT_ASSET = re.compile(
@@ -540,8 +540,11 @@ class TokenApiHandler(BaseHTTPRequestHandler):
             if command["status"] in {"queued", "dispatched"}:
                 client_id = str(command["client_id"])
                 active_by_client[client_id] = active_by_client.get(client_id, 0) + 1
+        client_records, suppressed_duplicate_count = _without_registration_race_duplicates(
+            registry.list_clients()
+        )
         clients: list[dict[str, Any]] = []
-        for client in registry.list_clients():
+        for client in client_records:
             account_names = [
                 account_by_id[account_id].username
                 for account_id in client["account_ids"]
@@ -552,6 +555,17 @@ class TokenApiHandler(BaseHTTPRequestHandler):
             item["online"] = now - float(client["last_seen_at"]) <= 150
             item["seconds_since_seen"] = round(max(0.0, now - float(client["last_seen_at"])), 1)
             item["active_command_count"] = active_by_client.get(str(client["client_id"]), 0)
+            live_status = _client_status_payload(
+                registry,
+                client["account_ids"],
+                now=now,
+                records_by_id=account_by_id,
+            )
+            # Client activity comes from its roughly one-minute heartbeat. AWS
+            # is authoritative for upload/readiness and changes immediately
+            # after an upload, so expose that state separately for the admin UI.
+            item["server_accounts"] = live_status["accounts"]
+            item["server_summary"] = live_status["summary"]
             clients.append(item)
         pool_status = registry.status()
         # The registry's general availability count is intentionally optimistic when a
@@ -571,6 +585,7 @@ class TokenApiHandler(BaseHTTPRequestHandler):
                     "accounts": accounts,
                 },
                 "clients": clients,
+                "suppressed_duplicate_client_count": suppressed_duplicate_count,
                 "commands": commands,
                 "client_events": registry.recent_client_events(limit=100),
                 "copilot_tests": self.server.ping_manager.recent(limit=20),
@@ -982,14 +997,17 @@ def _client_status_payload(
     account_ids: list[str],
     *,
     now: float | None = None,
+    records_by_id: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     current = time.time() if now is None else float(now)
     requested_ids = list(dict.fromkeys(account_ids))
-    records = {
-        record.account_id: record
-        for record in registry.list_accounts(enabled_only=False)
-        if record.account_id in requested_ids
-    }
+    records = records_by_id
+    if records is None:
+        records = {
+            record.account_id: record
+            for record in registry.list_accounts(enabled_only=False)
+            if record.account_id in requested_ids
+        }
     accounts: list[dict[str, Any]] = []
     for account_id in requested_ids:
         record = records.get(account_id)
@@ -1052,6 +1070,46 @@ def _client_status_payload(
         },
         "accounts": accounts,
     }
+
+
+def _without_registration_race_duplicates(
+    clients: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Hide only provable one-shot aliases created by the old first-run race.
+
+    A real second installation must not disappear merely because it uses the same
+    account or public IP. The old race has a much stronger fingerprint: two IDs
+    share the exact first observation, version, account set, and address, while
+    only one ID is ever seen again.
+    """
+
+    def fingerprint(client: dict[str, Any]) -> tuple[object, ...]:
+        return (
+            float(client.get("first_seen_at") or 0.0),
+            str(client.get("app_version") or ""),
+            tuple(str(value) for value in client.get("account_ids") or []),
+            str(client.get("remote_address") or ""),
+        )
+
+    continued = {
+        fingerprint(client)
+        for client in clients
+        if float(client.get("last_seen_at") or 0.0)
+        > float(client.get("first_seen_at") or 0.0) + 0.001
+    }
+    visible = [
+        client
+        for client in clients
+        if not (
+            fingerprint(client) in continued
+            and abs(
+                float(client.get("last_seen_at") or 0.0)
+                - float(client.get("first_seen_at") or 0.0)
+            )
+            <= 0.001
+        )
+    ]
+    return visible, len(clients) - len(visible)
 
 
 def _legacy_scoped_pool(

@@ -4,9 +4,11 @@ import base64
 import json
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -196,6 +198,31 @@ class InputSafetyTests(unittest.TestCase):
 
 
 class ClientBundleTests(unittest.TestCase):
+    def test_first_run_threads_share_one_persistent_client_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            barrier = threading.Barrier(16)
+
+            def synchronized_application_dir() -> Path:
+                barrier.wait(timeout=5)
+                return root
+
+            with patch.object(
+                client_upload,
+                "application_dir",
+                side_effect=synchronized_application_dir,
+            ):
+                with ThreadPoolExecutor(max_workers=16) as executor:
+                    client_ids = list(
+                        executor.map(lambda _: client_upload._client_installation_id(), range(16))
+                    )
+
+            self.assertEqual(len(set(client_ids)), 1)
+            self.assertEqual(
+                (root / "client-id.txt").read_text(encoding="ascii").strip(),
+                client_ids[0],
+            )
+
     def test_only_company_work_domains_are_automatically_renewed(self) -> None:
         for username in ("person@forvismazars.com", "PERSON@MAZARS.FR"):
             self.assertTrue(is_automatic_work_account(username), username)

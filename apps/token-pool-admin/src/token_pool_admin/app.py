@@ -396,12 +396,23 @@ class TokenPoolAdminApp:
             client_id = str(client.get("client_id") or "")
             names = client.get("account_usernames") if isinstance(client.get("account_usernames"), list) else []
             status = client.get("status") if isinstance(client.get("status"), dict) else {}
-            account_states = status.get("accounts") if isinstance(status.get("accounts"), list) else []
+            server_accounts = (
+                client.get("server_accounts")
+                if isinstance(client.get("server_accounts"), list)
+                else []
+            )
+            state_labels = {
+                "ready": "Ready on AWS",
+                "cooldown": "Ready on AWS (cooldown)",
+                "renewal_required": "Sign-in renewal due",
+                "not_uploaded": "Not uploaded to AWS",
+                "disabled": "Disabled on AWS",
+            }
             token_state = "; ".join(
-                str(item.get("status") or "unknown")
-                for item in account_states
+                state_labels.get(str(item.get("state") or ""), "Unknown on AWS")
+                for item in server_accounts
                 if isinstance(item, dict)
-            ) or "Waiting for client details"
+            ) or "No Microsoft account configured"
             online = bool(client.get("online"))
             activity = (
                 str(status.get("activity") or "Busy")
