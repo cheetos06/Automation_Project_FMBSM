@@ -42,6 +42,7 @@ from token_pool_client.app import (  # noqa: E402
     TokenPoolApp,
     _account_status,
     _authorization_expires_at,
+    _my_aws_status_text,
     _retry_is_due,
     _server_account_state,
 )
@@ -397,6 +398,47 @@ class ClientBundleTests(unittest.TestCase):
             "ready",
         )
 
+    def test_colleague_status_renders_only_locally_configured_accounts(self) -> None:
+        local = ClientAccount(
+            account_id="account-local",
+            username="colleague@mazars.fr",
+            tenant_id="tenant",
+            object_id="object",
+            session_dir="session",
+            profile_dir="profile",
+            access_expires_at=0,
+        )
+        text = _my_aws_status_text(
+            [local],
+            {
+                "version": "1.2.0",
+                "summary": {
+                    "configured_account_count": 1,
+                    "ready_account_count": 1,
+                },
+                "accounts": [
+                    {
+                        "account_id": "account-local",
+                        "uploaded": True,
+                        "ready": True,
+                        "state": "ready",
+                        "uploaded_at": 1784260000,
+                        "authorization_expires_at": 1784346400,
+                    },
+                    {
+                        "account_id": "account-other",
+                        "username": "other.person@mazars.fr",
+                        "uploaded": True,
+                        "ready": True,
+                        "state": "ready",
+                    },
+                ],
+            },
+        )
+        self.assertIn("colleague@mazars.fr: Uploaded and ready", text)
+        self.assertNotIn("other.person", text)
+        self.assertNotIn("account-other", text)
+
     def test_transient_connectivity_is_friendly_and_retried_with_new_request(self) -> None:
         self.assertTrue(is_transient_network_error(OSError("[WinError 10060] failed to respond")))
         config = ClientConfig("http://example.invalid", "key", Path("unused"), "repo")
@@ -561,6 +603,50 @@ class ClientBundleTests(unittest.TestCase):
                 app._fresh_renewal(account, automatic=True, allow_visible=False)
         renew.assert_called_once()
         self.assertTrue(any("Edge was not opened" in str(call) for call in app.log.call_args_list))
+
+    def test_remote_force_update_installs_reports_and_restarts(self) -> None:
+        app = TokenPoolApp.__new__(TokenPoolApp)
+        app.store = SimpleNamespace(root=Path("client-root"))
+        app.config = ClientConfig("http://example.invalid", "key", Path("unused"), "repo")
+        app.root = MagicMock()
+        app.log = MagicMock()
+        app.shutdown = MagicMock()
+        app._finish_admin_command = MagicMock()
+
+        def run_background(_label, work, *, on_complete, show_error):
+            on_complete(work(), None)
+            return True
+
+        app._background = run_background
+        command_id = "a" * 32
+        with patch(
+            "token_pool_client.app.check_for_update",
+            return_value=(True, "token-client-v1.0.11", "token-client-v1.0.12"),
+        ) as update, patch(
+            "token_pool_client.app.queue_admin_command_result"
+        ) as queue, patch(
+            "token_pool_client.app.flush_admin_command_results",
+            return_value=1,
+        ) as flush, patch(
+            "token_pool_client.app.restart_after_exit"
+        ) as restart:
+            app._execute_admin_command(
+                {"command_id": command_id, "command": "force_update", "payload": {}}
+            )
+
+        update.assert_called_once_with(app.store.root)
+        queue.assert_called_once_with(
+            command_id=command_id,
+            succeeded=True,
+            result={
+                "changed": True,
+                "before": "token-client-v1.0.11",
+                "after": "token-client-v1.0.12",
+            },
+        )
+        flush.assert_called_once_with(app.config)
+        restart.assert_called_once_with(app.store.root)
+        app.root.after.assert_called_once_with(0, app.shutdown)
 
     def test_expired_spa_refresh_token_requires_real_sign_in(self) -> None:
         self.assertTrue(

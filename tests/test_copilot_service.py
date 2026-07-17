@@ -30,6 +30,7 @@ from copilot_service.job_status import JobStatusStore  # noqa: E402
 from copilot_service.session_bundle import BundleValidationError, install_bundle  # noqa: E402
 from copilot_service.token_api import TokenApiServer  # noqa: E402
 from token_pool_client.upload import ClientConfig, client_preflight  # noqa: E402
+from token_pool_client.upload import server_status as client_server_status  # noqa: E402
 from token_pool_client.control import complete_admin_command, poll_admin_commands  # noqa: E402
 from token_pool_admin.api import AdminApiError  # noqa: E402
 from token_pool_admin.api import create_commands as admin_create_commands  # noqa: E402
@@ -201,6 +202,20 @@ class RegistryTests(unittest.TestCase):
                     self.assertEqual(initial["clients"][0]["account_ids"], [])
                     self.assertEqual(initial["clients"][0]["account_usernames"], [])
                     self.assertEqual(initial["pool"]["available_account_count"], 0)
+                    scoped = client_server_status(
+                        client_config,
+                        account_ids=[expired.account.account_id],
+                    )
+                    self.assertEqual(scoped["connection"], "online")
+                    self.assertEqual(scoped["summary"]["configured_account_count"], 1)
+                    self.assertEqual(scoped["summary"]["uploaded_account_count"], 1)
+                    self.assertEqual(scoped["summary"]["ready_account_count"], 0)
+                    self.assertEqual(len(scoped["accounts"]), 1)
+                    self.assertEqual(scoped["accounts"][0]["account_id"], expired.account.account_id)
+                    self.assertNotIn("username", scoped["accounts"][0])
+                    legacy = client_server_status(client_config)
+                    self.assertEqual(legacy["pool"]["accounts"], [])
+                    self.assertNotIn("jobs", legacy)
                     client_id = initial["clients"][0]["client_id"]
                     created = admin_create_commands(
                         admin_config,

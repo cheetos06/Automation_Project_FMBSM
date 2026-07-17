@@ -163,7 +163,7 @@ class TokenPoolApp:
         self.refresh_button.pack(side=LEFT)
         self.add_button = ttk.Button(controls, text="Add Microsoft account", command=self.add_account)
         self.add_button.pack(side=LEFT, padx=8)
-        self.status_button = ttk.Button(controls, text="Server status", command=self.show_status)
+        self.status_button = ttk.Button(controls, text="Check my AWS status", command=self.show_status)
         self.status_button.pack(side=LEFT)
         self.state_label = ttk.Label(controls, text="Ready", font=("Segoe UI Semibold", 10))
         self.state_label.pack(side=RIGHT, padx=5)
@@ -420,13 +420,12 @@ class TokenPoolApp:
                 continue
 
             try:
-                response = upload_bundle(self.config, create_bundle(renewed))
+                upload_bundle(self.config, create_bundle(renewed))
                 renewed.last_uploaded_at = time.time()
                 renewed.last_error = None
                 renewed.pending_upload = False
                 self.store.upsert(renewed)
-                available = response.get("pool", {}).get("available_account_count")
-                self.log(f"Uploaded {renewed.username}; server pool available={available}")
+                self.log(f"Uploaded {renewed.username}; AWS accepted the fresh authorization.")
                 successes += 1
             except Exception as exc:
                 if _is_transient_failure(exc):
@@ -544,12 +543,11 @@ class TokenPoolApp:
                 shutil.copytree(profile, final_profile, dirs_exist_ok=True)
                 account.session_dir = str(final_session)
                 account.profile_dir = str(final_profile)
-                response = upload_bundle(self.config, create_bundle(account))
+                upload_bundle(self.config, create_bundle(account))
                 account.last_uploaded_at = time.time()
                 self.store.upsert(account)
                 self.log(
-                    f"Added and uploaded {account.username}; "
-                    f"pool available={response.get('pool', {}).get('available_account_count')}"
+                    f"Added and uploaded {account.username}; AWS accepted the fresh authorization."
                 )
             finally:
                 bootstrap.set_interaction_callback(None)
@@ -560,21 +558,17 @@ class TokenPoolApp:
     def show_status(self) -> None:
         if not self.config:
             return
+        local_accounts = self.store.load()
 
         def work() -> None:
-            response = server_status(self.config)
-            pool = response.get("pool", {})
-            lines = [
-                f"Accounts: {pool.get('account_count', 0)}",
-                f"Available: {pool.get('available_account_count', 0)}",
-                f"Turns in the last hour: {pool.get('recent_turns', 0)}",
-            ]
-            for account in pool.get("accounts", []):
-                state = _server_account_state(account, now=float(pool.get("now") or response.get("now") or time.time()))
-                lines.append(f"{account.get('username')}: {state}, total turns={account.get('total_turns')}")
-            text = "\n".join(lines)
+            response = server_status(
+                self.config,
+                account_ids=[account.account_id for account in local_accounts],
+                status=self._client_control_status(),
+            )
+            text = _my_aws_status_text(local_accounts, response)
             self.log(text.replace("\n", " | "))
-            self.root.after(0, lambda: messagebox.showinfo("AWS Copilot pool", text))
+            self.root.after(0, lambda: messagebox.showinfo("Your AWS token status", text))
 
         self._background("Checking server...", work)
 
@@ -952,6 +946,51 @@ def _time_text(value: float | None) -> str:
     if not value:
         return "—"
     return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+
+
+def _my_aws_status_text(
+    local_accounts: list[ClientAccount],
+    response: dict[str, object],
+) -> str:
+    summary_value = response.get("summary")
+    summary = summary_value if isinstance(summary_value, dict) else {}
+    remote_value = response.get("accounts")
+    remote_accounts = {
+        str(account.get("account_id") or ""): account
+        for account in (remote_value if isinstance(remote_value, list) else [])
+        if isinstance(account, dict)
+    }
+    lines = [
+        "AWS connection: Online",
+        f"Server API: {response.get('version') or 'reachable'}",
+        (
+            "Your accounts ready on AWS: "
+            f"{summary.get('ready_account_count', 0)} / "
+            f"{summary.get('configured_account_count', len(local_accounts))}"
+        ),
+    ]
+    if not local_accounts:
+        lines.append("No Microsoft account is configured in this app yet.")
+    for account in local_accounts:
+        remote = remote_accounts.get(account.account_id)
+        if not remote or not remote.get("uploaded"):
+            lines.append(f"{account.username}: Not uploaded to AWS")
+            continue
+        state = str(remote.get("state") or "renewal_required")
+        if remote.get("ready"):
+            label = "Uploaded and ready"
+        elif state == "cooldown":
+            label = "Uploaded; temporarily on cooldown"
+        elif state == "disabled":
+            label = "Uploaded; disabled on AWS"
+        else:
+            label = "Uploaded; Microsoft renewal required"
+        lines.append(
+            f"{account.username}: {label} "
+            f"(uploaded {_time_text(remote.get('uploaded_at'))}; "
+            f"authorization valid until {_time_text(remote.get('authorization_expires_at'))})"
+        )
+    return "\n".join(lines)
 
 
 def _authorization_expires_at(account: ClientAccount) -> float | None:

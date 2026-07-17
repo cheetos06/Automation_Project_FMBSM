@@ -114,7 +114,64 @@ def upload_bundle(config: ClientConfig, bundle: bytes) -> dict[str, Any]:
     )
 
 
-def server_status(config: ClientConfig) -> dict[str, Any]:
+def server_status(
+    config: ClientConfig,
+    *,
+    account_ids: list[str] | None = None,
+    status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if account_ids is not None:
+        unique_ids = list(dict.fromkeys(account_ids))
+        body = json.dumps(
+            {
+                "client_id": _client_installation_id(),
+                "observed_at": time.time(),
+                "app_version": __version__,
+                "account_ids": unique_ids,
+                "status": status or {},
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        try:
+            return _request_with_retry(
+                lambda: _sign(
+                    urllib.request.Request(
+                        config.endpoint + "/v1/client/status",
+                        data=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "User-Agent": "FMBSM-Token-Pool-Client/1",
+                        },
+                        method="POST",
+                    ),
+                    config.upload_key,
+                    body,
+                ),
+                config,
+                timeout_seconds=4,
+                attempts=2,
+            )
+        except ServerRejectedError as exc:
+            if exc.status_code != 404 or exc.detail.get("error") != "not_found":
+                raise
+            legacy = server_status(config)
+            legacy.update(
+                {
+                    "connection": "online",
+                    "summary": {
+                        "configured_account_count": len(unique_ids),
+                        "uploaded_account_count": 0,
+                        "ready_account_count": 0,
+                        "renewal_required_count": 0,
+                        "missing_account_count": len(unique_ids),
+                    },
+                    "accounts": [],
+                    "scoped_status_supported": False,
+                }
+            )
+            return legacy
     return _request_with_retry(
         lambda: _sign(
             urllib.request.Request(

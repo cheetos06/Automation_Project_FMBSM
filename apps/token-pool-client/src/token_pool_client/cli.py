@@ -73,13 +73,13 @@ def main() -> int:
                     account.profile_path,
                     expected_account=account,
                 )
-                response = upload_bundle(config, create_bundle(refreshed))
+                upload_bundle(config, create_bundle(refreshed))
                 refreshed.last_uploaded_at = time.time()
                 refreshed.last_error = None
                 store.upsert(refreshed)
                 print(
                     f"uploaded username={refreshed.username} account={refreshed.account_id} "
-                    f"available={response.get('pool', {}).get('available_account_count')}",
+                    "aws_status=accepted",
                     flush=True,
                 )
             except Exception as exc:
@@ -88,7 +88,8 @@ def main() -> int:
         if failures:
             return 1
     if args.status:
-        print(server_status(config))
+        accounts = store.load()
+        print(server_status(config, account_ids=[account.account_id for account in accounts]))
     return 0
 
 

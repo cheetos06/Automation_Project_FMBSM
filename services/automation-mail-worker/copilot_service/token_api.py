@@ -39,7 +39,7 @@ from .upload_validation import MicrosoftSessionValidator, SessionProofUnavailabl
 
 
 LOGGER = logging.getLogger("copilot-token-api")
-SERVER_VERSION = "1.1.1"
+SERVER_VERSION = "1.2.0"
 TOKEN_CLIENT_DOWNLOAD_PREFIX = "/downloads/token-client/"
 TOKEN_CLIENT_TAG = re.compile(r"token-client-v[0-9]+\.[0-9]+\.[0-9]+(?:[-A-Za-z0-9.]*)?\Z")
 TOKEN_CLIENT_ASSET = re.compile(
@@ -161,11 +161,16 @@ class TokenApiHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "version": SERVER_VERSION,
-                    "pool": self.server.registry.status(),
-                    "jobs": [
-                        _public_job(job)
-                        for job in self.server.status_store.recent(limit=20)
-                    ],
+                    "server_time": time.time(),
+                    # Legacy clients can still prove connectivity, but a shared
+                    # upload credential must never reveal the global account pool.
+                    "pool": {
+                        "scope": "client_identification_required",
+                        "account_count": 0,
+                        "available_account_count": 0,
+                        "recent_turns": 0,
+                        "accounts": [],
+                    },
                 },
             )
             return
@@ -176,6 +181,9 @@ class TokenApiHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path.rstrip("/")
         if path == "/v1/client-events":
             self._receive_client_event()
+            return
+        if path == "/v1/client/status":
+            self._client_status()
             return
         if path == "/v1/client/commands/poll":
             self._poll_client_commands()
@@ -287,7 +295,14 @@ class TokenApiHandler(BaseHTTPRequestHandler):
                 "account": installed.account.as_public_dict(),
                 "bundle_sha256": installed.bundle_sha256,
                 "file_count": installed.file_count,
-                "pool": self.server.registry.status(),
+                "client_status": _client_status_payload(
+                    self.server.registry,
+                    [installed.account.account_id],
+                ),
+                "pool": _legacy_scoped_pool(
+                    self.server.registry,
+                    [installed.account.account_id],
+                ),
             },
         )
 
@@ -374,8 +389,37 @@ class TokenApiHandler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "event_id": event_id,
-                "pool": self.server.registry.status(),
+                "client_status": _client_status_payload(
+                    self.server.registry,
+                    account_ids,
+                ),
+                "pool": _legacy_scoped_pool(
+                    self.server.registry,
+                    account_ids,
+                ),
             },
+        )
+
+    def _client_status(self) -> None:
+        parsed = self._read_json_body(MAX_CONTROL_BODY_BYTES)
+        if parsed is None:
+            return
+        body, payload = parsed
+        if not self._authenticated(body):
+            return
+        presence = self._validated_client_presence(payload, event="status_check")
+        if presence is None:
+            return
+        self.server.registry.update_client_presence(
+            **presence,
+            remote_address=self.client_address[0],
+        )
+        self._json(
+            HTTPStatus.OK,
+            _client_status_payload(
+                self.server.registry,
+                presence["account_ids"],
+            ),
         )
 
     def _poll_client_commands(self) -> None:
@@ -876,6 +920,99 @@ class TokenApiHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:
         LOGGER.info("remote=%s %s", self.client_address[0], format % args)
+
+
+def _client_status_payload(
+    registry: CopilotRegistry,
+    account_ids: list[str],
+    *,
+    now: float | None = None,
+) -> dict[str, Any]:
+    current = time.time() if now is None else float(now)
+    requested_ids = list(dict.fromkeys(account_ids))
+    records = {
+        record.account_id: record
+        for record in registry.list_accounts(enabled_only=False)
+        if record.account_id in requested_ids
+    }
+    accounts: list[dict[str, Any]] = []
+    for account_id in requested_ids:
+        record = records.get(account_id)
+        if record is None:
+            accounts.append(
+                {
+                    "account_id": account_id,
+                    "uploaded": False,
+                    "ready": False,
+                    "state": "not_uploaded",
+                    "uploaded_at": None,
+                    "authorization_expires_at": None,
+                }
+            )
+            continue
+        public = record.as_public_dict(now=current)
+        ready = bool(public.get("runtime_available"))
+        if (
+            record.access_expires_at <= current + 60
+            and record.last_error
+            and record.last_error.startswith("token_refresh_failed:")
+        ):
+            ready = False
+        if not record.enabled:
+            state = "disabled"
+        elif public.get("cooling_down"):
+            state = "cooldown"
+        elif ready:
+            state = "ready"
+        else:
+            state = "renewal_required"
+        accounts.append(
+            {
+                "account_id": account_id,
+                "uploaded": True,
+                "ready": ready,
+                "state": state,
+                "uploaded_at": record.uploaded_at,
+                "authorization_expires_at": record.refresh_expires_at,
+                "access_expires_at": record.access_expires_at,
+                "cooldown_until": record.cooldown_until if public.get("cooling_down") else None,
+            }
+        )
+    uploaded = sum(bool(account["uploaded"]) for account in accounts)
+    ready = sum(bool(account["ready"]) for account in accounts)
+    return {
+        "ok": True,
+        "version": SERVER_VERSION,
+        "server_time": current,
+        "connection": "online",
+        "summary": {
+            "configured_account_count": len(requested_ids),
+            "uploaded_account_count": uploaded,
+            "ready_account_count": ready,
+            "renewal_required_count": sum(
+                bool(account["uploaded"]) and not bool(account["ready"])
+                for account in accounts
+            ),
+            "missing_account_count": len(accounts) - uploaded,
+        },
+        "accounts": accounts,
+    }
+
+
+def _legacy_scoped_pool(
+    registry: CopilotRegistry,
+    account_ids: list[str],
+) -> dict[str, Any]:
+    status = _client_status_payload(registry, account_ids)
+    summary = status["summary"]
+    return {
+        "scope": "current_client",
+        "now": status["server_time"],
+        "account_count": summary["uploaded_account_count"],
+        "available_account_count": summary["ready_account_count"],
+        "recent_turns": 0,
+        "accounts": status["accounts"],
+    }
 
 
 def _public_job(job: dict[str, Any]) -> dict[str, Any]:
