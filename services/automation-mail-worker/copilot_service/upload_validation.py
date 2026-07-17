@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from collections.abc import Callable
@@ -23,10 +24,22 @@ from .session_bundle import (
 
 EXPECTED_AUDIENCE = "https://substrate.office.com/sydney"
 _TENANT_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_AADSTS_CODE = re.compile(r"\b(AADSTS\d+)\b", re.IGNORECASE)
+_INTERACTIVE_MFA_CODES = frozenset({"AADSTS50072", "AADSTS50074", "AADSTS50076", "AADSTS50078", "AADSTS50079"})
+LOGGER = logging.getLogger("copilot-session-validator")
 
 
 class SessionProofUnavailable(RuntimeError):
     """The server could not ask Microsoft to prove the uploaded session."""
+
+
+class MicrosoftSessionRejected(BundleValidationError):
+    """Microsoft rejected a presented refresh token with a safe error classification."""
+
+    def __init__(self, microsoft_error_code: str | None) -> None:
+        self.microsoft_error_code = microsoft_error_code
+        self.requires_interactive_mfa = microsoft_error_code in _INTERACTIVE_MFA_CODES
+        super().__init__("Microsoft rejected the uploaded refresh token; run the desktop token app again")
 
 
 class MicrosoftSessionValidator:
@@ -64,9 +77,18 @@ class MicrosoftSessionValidator:
         try:
             refreshed_oauth = self.oauth_exchanger(tenant_id, refresh_token, self.timeout_seconds)
         except OAuthRefreshRejected as exc:
-            raise BundleValidationError(
-                "Microsoft rejected the uploaded refresh token; run the desktop token app again"
-            ) from exc
+            # OAuthRefreshRejected contains Microsoft's HTTP/AADSTS explanation,
+            # but never the submitted refresh token.  Keep the client response
+            # generic while retaining enough information in the private service
+            # journal to diagnose Conditional Access and device-bound sessions.
+            LOGGER.warning(
+                "Microsoft rejected uploaded session proof tenant=%s reason=%s",
+                tenant_id,
+                exc,
+            )
+            match = _AADSTS_CODE.search(str(exc))
+            code = match.group(1).upper() if match else None
+            raise MicrosoftSessionRejected(code) from exc
         except OAuthRefreshUnavailable as exc:
             raise SessionProofUnavailable(str(exc)) from exc
         except Exception as exc:

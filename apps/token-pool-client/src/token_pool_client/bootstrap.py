@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -321,8 +322,108 @@ def click_sources_menu_if_present(page: Page) -> bool:
         return False
 
 
+def dismiss_copilot_overlays(page: Page) -> int:
+    """Dismiss only explicit welcome/coachmark controls that obstruct chat input."""
+
+    labels = re.compile(
+        r"^(got it|skip|skip tour|dismiss|not now|maybe later|close|"
+        r"j['’]ai compris|ignorer|passer|plus tard|fermer)$",
+        re.IGNORECASE,
+    )
+    dismissed = 0
+    for _ in range(3):
+        control: Locator | None = None
+        containers = page.locator(
+            '[role="dialog"], [aria-modal="true"], [data-testid*="coach" i], [class*="coachmark" i]'
+        )
+        try:
+            count = min(containers.count(), 10)
+        except Exception:
+            count = 0
+        for index in range(count - 1, -1, -1):
+            container = containers.nth(index)
+            try:
+                if not container.is_visible(timeout=300):
+                    continue
+                candidate = container.get_by_role("button", name=labels)
+                if candidate.count() > 0 and candidate.first().is_visible(timeout=300):
+                    control = candidate.first()
+                    break
+            except Exception:
+                continue
+        if control is None:
+            break
+        try:
+            control.click(timeout=2000)
+            dismissed += 1
+            page.wait_for_timeout(500)
+        except Exception:
+            break
+    return dismissed
+
+
+def explicit_upload_control(page: Page) -> Locator | None:
+    control = first_visible(
+        page,
+        [
+            '[role="menuitem"][data-testid*="upload" i]',
+            '[role="menuitem"]:has-text("Upload images and files")',
+            '[role="menuitem"]:has-text("Upload from this device")',
+            '[role="menuitem"]:has-text("Upload from device")',
+            '[role="menuitem"]:has-text("Browse this device")',
+            '[role="menuitem"]:has-text("Attach from device")',
+            '[role="menuitem"]:has-text("Téléverser")',
+            '[role="menuitem"]:has-text("Charger depuis")',
+            '[role="menuitem"]:has-text("Télécharger à partir")',
+            'button[aria-label*="Attach" i]',
+            'button[aria-label*="Upload" i]',
+            'button[aria-label*="device" i]',
+            'button[aria-label*="Image" i]',
+            'button[title*="Attach" i]',
+            'button[title*="Upload" i]',
+            'button[title*="device" i]',
+            'button[title*="Image" i]',
+        ],
+    )
+    if control is not None:
+        return control
+
+    # Copilot A/B tests frequently change the menu item's element type and
+    # wording. Inspect only visible menu items and require both an upload verb
+    # and a local-file noun so unrelated Copilot controls are never clicked.
+    items = page.locator('[role="menuitem"], [role="option"]')
+    upload_terms = ("upload", "attach", "browse", "télévers", "charger", "télécharg")
+    file_terms = ("file", "image", "device", "computer", "fichier", "appareil", "ordinateur")
+    try:
+        count = min(items.count(), 30)
+    except Exception:
+        count = 0
+    for index in range(count):
+        item = items.nth(index)
+        try:
+            if not item.is_visible(timeout=300):
+                continue
+            label = " ".join(
+                (
+                    item.inner_text(timeout=500),
+                    item.get_attribute("aria-label") or "",
+                    item.get_attribute("title") or "",
+                )
+            ).lower()
+            if any(term in label for term in upload_terms) and any(term in label for term in file_terms):
+                return item
+        except Exception:
+            continue
+    return None
+
+
 def upload_image_or_pause(page: Page, image_path: Path, *, interactive: bool = True) -> str:
+    dismiss_copilot_overlays(page)
     opened_sources_menu = click_sources_menu_if_present(page)
+    if dismiss_copilot_overlays(page):
+        # A first-use coachmark can appear only after opening the menu and then
+        # close that menu when dismissed. Open it once more before probing.
+        opened_sources_menu = click_sources_menu_if_present(page)
     direct_input = wait_for_file_input(page, timeout_ms=10000 if opened_sources_menu else 1000)
     if direct_input is not None:
         try:
@@ -337,19 +438,7 @@ def upload_image_or_pause(page: Page, image_path: Path, *, interactive: bool = T
 
     # Choose at most one explicit upload control. Broad role/name probing used
     # to click unrelated controls when Copilot restored an existing chat.
-    upload_button = first_visible(page, [
-        '[role="menuitem"]:has-text("Upload images and files")',
-        '[role="menuitem"]:has-text("Upload")',
-        '[role="menuitem"]:has-text("images and files")',
-        'button[aria-label*="Attach" i]',
-        'button[aria-label*="Upload" i]',
-        'button[aria-label*="device" i]',
-        'button[aria-label*="Image" i]',
-        'button[title*="Attach" i]',
-        'button[title*="Upload" i]',
-        'button[title*="device" i]',
-        'button[title*="Image" i]',
-    ])
+    upload_button = explicit_upload_control(page)
     if upload_button is not None:
         try:
             with page.expect_file_chooser(timeout=3000) as chooser_info:
@@ -357,8 +446,16 @@ def upload_image_or_pause(page: Page, image_path: Path, *, interactive: bool = T
             chooser_info.value.set_files(str(image_path))
             page.wait_for_timeout(8000)
             return "filechooser"
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"Upload: file chooser path failed, checking for a newly created file input. Details: {exc}")
+            direct_input = wait_for_file_input(page, timeout_ms=3000)
+            if direct_input is not None:
+                try:
+                    direct_input.set_input_files(str(image_path), timeout=10000)
+                    page.wait_for_timeout(8000)
+                    return "input[type=file] after upload control"
+                except Exception as input_exc:
+                    print(f"Upload: new file input failed. Details: {input_exc}")
 
     if not interactive:
         raise RuntimeError("Could not find an upload control for the image.")
@@ -367,9 +464,21 @@ def upload_image_or_pause(page: Page, image_path: Path, *, interactive: bool = T
     print("In the browser window:")
     print("1. Make sure you are on the Copilot chat page.")
     print("2. Click the plus, paperclip, image, or attachment button near the chat box.")
-    print(f"3. Choose this rendered image: {image_path}")
+    print(f"3. Choose this exact bootstrap image: {image_path}")
     print("4. Wait until the image preview/attachment appears.")
-    _pause("Attach the displayed image, then continue in the Token Pool Client.")
+    try:
+        subprocess.Popen(
+            ["explorer.exe", f"/select,{image_path}"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        pass
+    _pause(
+        "Copilot changed its upload control and automatic attachment could not finish.\n\n"
+        f"File Explorer has been opened on the required file:\n{image_path}\n\n"
+        "Attach that exact file in Copilot, wait for its preview, then click OK. "
+        "Do not type or send a prompt yourself."
+    )
     return "manual"
 
 
@@ -756,6 +865,7 @@ def renew_microsoft_session(
     progress: Callable[[str], None] | None = None,
     mode: str = "select_account",
     prompt_user: bool = True,
+    force_mfa: bool = False,
 ) -> dict[str, Any]:
     """Create a genuinely new SPA authorization, not an RT-grant rotation.
 
@@ -791,7 +901,11 @@ def renew_microsoft_session(
             # scheduled work-account path; they are what makes fresh auth silent.
             if progress is not None:
                 progress("Starting a fresh Microsoft authorization (not a token rotation)...")
-            _clear_stale_msal_cache(page, context, clear_cookies=mode == "select_account")
+            _clear_stale_msal_cache(
+                page,
+                context,
+                clear_cookies=mode == "select_account" or force_mfa,
+            )
             if progress is not None:
                 if mode == "silent":
                     progress(f"Using the saved Microsoft SSO session for {expected_username}...")
@@ -810,6 +924,20 @@ def renew_microsoft_session(
                 "sso_reload": "true",
                 "login_hint": expected_username,
             }
+            if force_mfa:
+                # AADSTS50072/74/76/78/79 means the token can work on the
+                # managed PC while Azure rejects it from AWS until the user
+                # performs fresh strong authentication. Request a new auth
+                # event and explicitly ask Entra for a fresh MFA method claim.
+                authorize_parameters["max_age"] = "0"
+                authorize_parameters["claims"] = json.dumps(
+                    {
+                        "access_token": {
+                            "amr": {"essential": True, "values": ["ngcmfa", "mfa"]}
+                        }
+                    },
+                    separators=(",", ":"),
+                )
             if mode == "silent":
                 # Selecting the already-known tile starts a new authorization and
                 # therefore a new fixed 24-hour SPA lifetime. prompt=none can return

@@ -32,6 +32,7 @@ from copilot_service.token_api import TokenApiServer  # noqa: E402
 from token_pool_client.upload import ClientConfig, client_preflight  # noqa: E402
 from token_pool_client.upload import server_status as client_server_status  # noqa: E402
 from token_pool_client.control import complete_admin_command, poll_admin_commands  # noqa: E402
+from token_pool_admin import api as admin_api  # noqa: E402
 from token_pool_admin.api import AdminApiError  # noqa: E402
 from token_pool_admin.api import create_commands as admin_create_commands  # noqa: E402
 from token_pool_admin.api import snapshot as admin_snapshot  # noqa: E402
@@ -89,6 +90,34 @@ def bundle_bytes(
 
 
 class RegistryTests(unittest.TestCase):
+    def test_admin_api_retries_directly_when_configured_proxy_is_dead(self) -> None:
+        config = AdminConfig("http://example.invalid", "a" * 32, Path("unused.pem"))
+        proxy_opener = MagicMock()
+        proxy_opener.open.side_effect = urllib.error.URLError("proxy unavailable")
+        response = MagicMock()
+        response.status = 200
+        response.headers.get.return_value = "application/vnd.fmbsm.admin+aesgcm"
+        response.read.return_value = b"encrypted"
+        direct_context = MagicMock()
+        direct_context.__enter__.return_value = response
+        direct_opener = MagicMock()
+        direct_opener.open.return_value = direct_context
+        admin_api._PROXY_ROUTE_CACHE.clear()
+
+        with patch(
+            "token_pool_admin.api._opener",
+            side_effect=[proxy_opener, direct_opener],
+        ) as opener, patch(
+            "token_pool_admin.api._decode_response",
+            return_value={"ok": True},
+        ):
+            result = admin_snapshot(config)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(opener.call_args_list[0].kwargs["use_proxy"])
+        self.assertFalse(opener.call_args_list[1].kwargs["use_proxy"])
+        self.assertFalse(admin_api._PROXY_ROUTE_CACHE[config.endpoint])
+
     def test_turn_usage_distinguishes_hour_day_and_lifetime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             registry = CopilotRegistry(Path(temporary))

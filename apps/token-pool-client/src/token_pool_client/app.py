@@ -40,6 +40,7 @@ from .storage import AccountStore, ClientAccount
 from .tray import NotificationTray
 from .upload import (
     ClientConfig,
+    ServerRejectedError,
     client_preflight,
     is_transient_network_error,
     load_config,
@@ -538,12 +539,40 @@ class TokenPoolApp:
                     headless=False,
                 )
                 account, _ = initialize_refresh(session, profile)
+                try:
+                    upload_bundle(self.config, create_bundle(account))
+                except ServerRejectedError as exc:
+                    if exc.detail.get("action") != "interactive_mfa_required":
+                        raise
+                    code = str(exc.detail.get("microsoft_error_code") or "Microsoft policy")
+                    self.log(
+                        f"{code}: AWS requires fresh Microsoft MFA for {account.username}; "
+                        "reopening Edge for one interactive authorization..."
+                    )
+                    bootstrap.renew_microsoft_session(
+                        site="https://m365.cloud.microsoft/chat",
+                        profile_dir=profile,
+                        session_dir=session,
+                        expected_username=account.username,
+                        expected_tenant=account.tenant_id,
+                        channel="msedge",
+                        timeout_seconds=int(os.getenv("TOKEN_POOL_VISIBLE_AUTH_TIMEOUT", "300")),
+                        progress=self.log,
+                        mode="expected_account",
+                        prompt_user=True,
+                        force_mfa=True,
+                    )
+                    account, _ = initialize_refresh(
+                        session,
+                        profile,
+                        expected_account=account,
+                    )
+                    upload_bundle(self.config, create_bundle(account))
                 final_session, final_profile = self.store.account_paths(account.account_id)
                 shutil.copytree(session, final_session, dirs_exist_ok=True)
                 shutil.copytree(profile, final_profile, dirs_exist_ok=True)
                 account.session_dir = str(final_session)
                 account.profile_dir = str(final_profile)
-                upload_bundle(self.config, create_bundle(account))
                 account.last_uploaded_at = time.time()
                 self.store.upsert(account)
                 self.log(

@@ -35,11 +35,11 @@ from .transport_crypto import (
     decrypt_envelope,
     load_private_key,
 )
-from .upload_validation import MicrosoftSessionValidator, SessionProofUnavailable
+from .upload_validation import MicrosoftSessionRejected, MicrosoftSessionValidator, SessionProofUnavailable
 
 
 LOGGER = logging.getLogger("copilot-token-api")
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.0"
 TOKEN_CLIENT_DOWNLOAD_PREFIX = "/downloads/token-client/"
 TOKEN_CLIENT_TAG = re.compile(r"token-client-v[0-9]+\.[0-9]+\.[0-9]+(?:[-A-Za-z0-9.]*)?\Z")
 TOKEN_CLIENT_ASSET = re.compile(
@@ -267,9 +267,24 @@ class TokenApiHandler(BaseHTTPRequestHandler):
             return
         except BundleValidationError as exc:
             LOGGER.warning("Rejected bundle request_id=%s remote=%s reason=%s", request_id, self.client_address[0], exc)
+            detail = str(exc)
+            response: dict[str, Any] = {
+                "ok": False,
+                "request_id": request_id,
+                "error": "invalid_bundle",
+                "detail": detail,
+            }
+            if isinstance(exc, MicrosoftSessionRejected):
+                response["microsoft_error_code"] = exc.microsoft_error_code
+                if exc.requires_interactive_mfa:
+                    response["action"] = "interactive_mfa_required"
+                    response["detail"] = (
+                        "Microsoft requires fresh multi-factor authentication for Copilot. "
+                        "Complete the new sign-in in the desktop token app."
+                    )
             self._json(
                 HTTPStatus.BAD_REQUEST,
-                {"ok": False, "request_id": request_id, "error": "invalid_bundle", "detail": str(exc)},
+                response,
             )
             return
         except Exception:

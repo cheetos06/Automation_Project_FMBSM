@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import os
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -36,6 +37,10 @@ class ServerRejectedError(RuntimeError):
         self.status_code = status_code
         self.detail = detail
         super().__init__(f"Server rejected the request: {detail}")
+
+
+_ROUTE_LOCK = threading.Lock()
+_PROXY_ROUTE_CACHE: dict[str, bool] = {}
 
 
 _TRANSIENT_MARKERS = (
@@ -303,28 +308,83 @@ def _open_json(
     *,
     timeout_seconds: float,
 ) -> dict[str, Any]:
+    original_url = request.full_url
+    original_headers = dict(request.header_items())
+    original_body = request.data
+    original_method = request.get_method()
+    route_key = _route_key(original_url)
+    last_error: BaseException | None = None
+    for use_proxy in _proxy_route_order(route_key):
+        # ProxyHandler mutates a Request when routing it through an HTTP proxy.
+        # Rebuild it for every route so a failed proxy attempt cannot leak its
+        # proxy host into the subsequent direct attempt.
+        attempt_request = urllib.request.Request(
+            original_url,
+            data=original_body,
+            headers=original_headers,
+            method=original_method,
+        )
+        opener = _opener(config, original_url, use_proxy=use_proxy)
+        try:
+            with opener.open(attempt_request, timeout=timeout_seconds) as response:
+                value = json.loads(response.read().decode("utf-8"))
+            _remember_proxy_route(route_key, use_proxy)
+            return value
+        except urllib.error.HTTPError as exc:
+            try:
+                raw_detail = exc.read()
+                detail = json.loads(raw_detail.decode("utf-8"))
+            except Exception:
+                detail = None
+            if use_proxy and not isinstance(detail, dict):
+                # Corporate proxies commonly return an HTML 407/502 page when
+                # disabled or disconnected. It is not a token-server response.
+                last_error = exc
+                continue
+            if exc.code >= 500:
+                raise TransientNetworkError(
+                    "The AWS token service is temporarily unavailable. The app will retry automatically."
+                ) from exc
+            if not isinstance(detail, dict):
+                detail = {"error": str(exc)}
+            raise ServerRejectedError(exc.code, detail) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+            continue
+    raise TransientNetworkError(
+        "The internet or AWS token service is temporarily unavailable. The app will retry automatically."
+    ) from last_error
+
+
+def _route_key(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+def _proxy_route_order(route_key: str) -> tuple[bool, bool]:
+    with _ROUTE_LOCK:
+        preferred = _PROXY_ROUTE_CACHE.get(route_key, True)
+    return preferred, not preferred
+
+
+def _remember_proxy_route(route_key: str, use_proxy: bool) -> None:
+    with _ROUTE_LOCK:
+        _PROXY_ROUTE_CACHE[route_key] = use_proxy
+
+
+def _opener(
+    config: ClientConfig,
+    url: str,
+    *,
+    use_proxy: bool,
+) -> urllib.request.OpenerDirector:
     handlers: list[urllib.request.BaseHandler] = []
-    if urllib.parse.urlsplit(request.full_url).scheme.lower() == "https":
+    if not use_proxy:
+        handlers.append(urllib.request.ProxyHandler({}))
+    if urllib.parse.urlsplit(url).scheme.lower() == "https":
         context = ssl.create_default_context(cafile=str(config.ca_certificate))
         handlers.append(urllib.request.HTTPSHandler(context=context))
-    opener = urllib.request.build_opener(*handlers)
-    try:
-        with opener.open(request, timeout=timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if exc.code >= 500:
-            raise TransientNetworkError(
-                "The AWS token service is temporarily unavailable. The app will retry automatically."
-            ) from exc
-        try:
-            detail = json.loads(exc.read().decode("utf-8"))
-        except Exception:
-            detail = {"error": str(exc)}
-        raise ServerRejectedError(exc.code, detail) from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise TransientNetworkError(
-            "The internet or AWS token service is temporarily unavailable. The app will retry automatically."
-        ) from exc
+    return urllib.request.build_opener(*handlers)
 
 
 def _alternate_transport_request(

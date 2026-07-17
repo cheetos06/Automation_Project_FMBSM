@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -22,6 +23,8 @@ class AdminApiError(RuntimeError):
 
 
 ADMIN_ENVELOPE_CONTENT_TYPE = "application/vnd.fmbsm.admin+aesgcm"
+_ROUTE_LOCK = threading.Lock()
+_PROXY_ROUTE_CACHE: dict[str, bool] = {}
 
 
 def snapshot(config: AdminConfig) -> dict[str, Any]:
@@ -85,51 +88,92 @@ def _post(
         canonical,
         hashlib.sha256,
     ).hexdigest()
-    request = urllib.request.Request(
-        config.endpoint + path,
-        data=body,
-        headers={
-            "Content-Type": ADMIN_ENVELOPE_CONTENT_TYPE,
-            "User-Agent": "FMBSM-Token-Pool-Admin/1",
-            "X-FMBSM-Admin-Timestamp": timestamp,
-            "X-FMBSM-Admin-Nonce": nonce,
-            "X-FMBSM-Admin-Signature": signature,
-        },
-        method="POST",
-    )
-    handlers: list[urllib.request.BaseHandler] = []
-    if urllib.parse.urlsplit(config.endpoint).scheme.lower() == "https":
-        context = ssl.create_default_context(cafile=str(config.ca_certificate))
-        handlers.append(urllib.request.HTTPSHandler(context=context))
-    opener = urllib.request.build_opener(*handlers)
-    try:
-        with opener.open(request, timeout=timeout) as response:
-            value = _decode_response(
-                response.read(),
-                status=response.status,
-                content_type=response.headers.get("Content-Type", ""),
-                path=path,
-                request_nonce=nonce,
-                admin_key=config.admin_key,
-            )
-    except urllib.error.HTTPError as exc:
+    headers = {
+        "Content-Type": ADMIN_ENVELOPE_CONTENT_TYPE,
+        "User-Agent": "FMBSM-Token-Pool-Admin/1",
+        "X-FMBSM-Admin-Timestamp": timestamp,
+        "X-FMBSM-Admin-Nonce": nonce,
+        "X-FMBSM-Admin-Signature": signature,
+    }
+    value: dict[str, Any] | None = None
+    last_network_error: BaseException | None = None
+    for use_proxy in _proxy_route_order(config.endpoint):
+        request = urllib.request.Request(
+            config.endpoint + path,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        opener = _opener(config, use_proxy=use_proxy)
         try:
-            detail = _decode_response(
-                exc.read(),
-                status=exc.code,
-                content_type=exc.headers.get("Content-Type", ""),
-                path=path,
-                request_nonce=nonce,
-                admin_key=config.admin_key,
-            )
-        except Exception:
-            detail = {"error": str(exc)}
-        raise AdminApiError(f"Server rejected administrator request: {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise AdminApiError(f"Cannot reach the FMBSM server: {exc}") from exc
+            with opener.open(request, timeout=timeout) as response:
+                value = _decode_response(
+                    response.read(),
+                    status=response.status,
+                    content_type=response.headers.get("Content-Type", ""),
+                    path=path,
+                    request_nonce=nonce,
+                    admin_key=config.admin_key,
+                )
+            _remember_proxy_route(config.endpoint, use_proxy)
+            break
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = _decode_response(
+                    exc.read(),
+                    status=exc.code,
+                    content_type=exc.headers.get("Content-Type", ""),
+                    path=path,
+                    request_nonce=nonce,
+                    admin_key=config.admin_key,
+                )
+            except Exception:
+                # A configured proxy can answer with its own HTML 407/502/503
+                # page. That is not an authenticated FMBSM server rejection;
+                # treat it like a failed proxy route and try direct transport.
+                if use_proxy:
+                    last_network_error = exc
+                    continue
+                detail = {"error": str(exc)}
+            raise AdminApiError(f"Server rejected administrator request: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_network_error = exc
+            continue
+    if value is None:
+        raise AdminApiError(f"Cannot reach the FMBSM server: {last_network_error}") from last_network_error
     if not isinstance(value, dict):
         raise AdminApiError("Server returned an invalid administrator response")
     return value
+
+
+def _proxy_route_order(endpoint: str) -> tuple[bool, bool]:
+    """Try the last working route first, then the other route.
+
+    Python honours HTTP_PROXY/HTTPS_PROXY environment variables independently
+    from the Windows proxy toggle.  A colleague can therefore disable a proxy
+    in Windows while a packaged process still inherits a now-dead proxy address.
+    The admin envelope is encrypted and authenticated at the application layer,
+    so retrying the same signed request directly does not weaken transport safety.
+    """
+
+    with _ROUTE_LOCK:
+        preferred = _PROXY_ROUTE_CACHE.get(endpoint, True)
+    return preferred, not preferred
+
+
+def _remember_proxy_route(endpoint: str, use_proxy: bool) -> None:
+    with _ROUTE_LOCK:
+        _PROXY_ROUTE_CACHE[endpoint] = use_proxy
+
+
+def _opener(config: AdminConfig, *, use_proxy: bool) -> urllib.request.OpenerDirector:
+    handlers: list[urllib.request.BaseHandler] = []
+    if not use_proxy:
+        handlers.append(urllib.request.ProxyHandler({}))
+    if urllib.parse.urlsplit(config.endpoint).scheme.lower() == "https":
+        context = ssl.create_default_context(cafile=str(config.ca_certificate))
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    return urllib.request.build_opener(*handlers)
 
 
 def _decode_response(

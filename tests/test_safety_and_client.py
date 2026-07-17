@@ -30,6 +30,7 @@ from fmbsm_email_bot.mail import _unread_subject_search_terms  # noqa: E402
 from fmbsm_email_bot.worker import _is_authorized_job_sender  # noqa: E402
 from fmbsm_email_bot.zip_utils import safe_extract_files  # noqa: E402
 from token_pool_client.bundle import create_bundle  # noqa: E402
+from token_pool_client import upload as client_upload  # noqa: E402
 from token_pool_client.automation import (  # noqa: E402
     AutomationState,
     configured_refresh_times,
@@ -50,6 +51,8 @@ from token_pool_client.app import (  # noqa: E402
 from token_pool_client.bootstrap import (  # noqa: E402
     BrowserConnectivityError,
     InteractiveAuthenticationRequired,
+    click_sources_menu_if_present,
+    explicit_upload_control,
     explicit_authentication_required,
     navigate,
     upload_image_or_pause,
@@ -59,7 +62,7 @@ from token_pool_client.refresh import (  # noqa: E402
     decrypt_captured_msal,
     requires_interactive_reauthentication,
 )
-from token_pool_client.storage import ClientAccount  # noqa: E402
+from token_pool_client.storage import AccountStore, ClientAccount  # noqa: E402
 from token_pool_client.transport_crypto import encrypt_bundle  # noqa: E402
 from token_pool_client.upload import (  # noqa: E402
     ClientConfig,
@@ -75,6 +78,7 @@ from copilot_service.microsoft_oauth import CLIENT_ID, OAuthRefreshRejected  # n
 from copilot_service.session_bundle import BundleValidationError  # noqa: E402
 from copilot_service.upload_validation import (  # noqa: E402
     EXPECTED_AUDIENCE,
+    MicrosoftSessionRejected,
     MicrosoftSessionValidator,
 )
 
@@ -542,6 +546,35 @@ class ClientBundleTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         fallback.assert_called_once_with(config)
 
+    def test_client_api_rebuilds_request_before_direct_proxy_fallback(self) -> None:
+        config = ClientConfig("http://example.invalid", "k" * 32, Path("unused"), "repo")
+        proxy_opener = MagicMock()
+        proxy_opener.open.side_effect = urllib.error.URLError("proxy unavailable")
+        response = MagicMock()
+        response.read.return_value = b'{"ok":true}'
+        direct_context = MagicMock()
+        direct_context.__enter__.return_value = response
+        direct_opener = MagicMock()
+        direct_opener.open.return_value = direct_context
+        client_upload._PROXY_ROUTE_CACHE.clear()
+        request = urllib.request.Request(
+            "http://example.invalid/v1/client/status",
+            data=b"{}",
+            method="POST",
+        )
+
+        with patch(
+            "token_pool_client.upload._opener",
+            side_effect=[proxy_opener, direct_opener],
+        ):
+            result = client_upload._open_json(request, config, timeout_seconds=1)
+
+        self.assertTrue(result["ok"])
+        first_request = proxy_opener.open.call_args.args[0]
+        second_request = direct_opener.open.call_args.args[0]
+        self.assertIsNot(first_request, second_request)
+        self.assertFalse(client_upload._PROXY_ROUTE_CACHE["http://example.invalid"])
+
     def test_bootstrap_upload_clicks_only_one_explicit_control(self) -> None:
         page = MagicMock()
         button = MagicMock()
@@ -557,6 +590,24 @@ class ClientBundleTests(unittest.TestCase):
         self.assertEqual(method, "filechooser")
         button.click.assert_called_once()
         page.get_by_role.assert_not_called()
+
+    def test_sources_menu_click_and_ab_test_upload_label_are_supported(self) -> None:
+        page = MagicMock()
+        sources = MagicMock()
+        with patch("token_pool_client.bootstrap.first_visible", return_value=sources):
+            self.assertTrue(click_sources_menu_if_present(page))
+        sources.click.assert_called_once()
+
+        item = MagicMock()
+        item.is_visible.return_value = True
+        item.inner_text.return_value = "Upload from this computer"
+        item.get_attribute.return_value = None
+        items = MagicMock()
+        items.count.return_value = 1
+        items.nth.return_value = item
+        page.locator.return_value = items
+        with patch("token_pool_client.bootstrap.first_visible", return_value=None):
+            self.assertIs(explicit_upload_control(page), item)
 
     def test_navigation_timeout_requires_a_usable_microsoft_dom(self) -> None:
         stalled = MagicMock()
@@ -751,6 +802,73 @@ class ClientBundleTests(unittest.TestCase):
         )
         with self.assertRaises(BundleValidationError):
             swapped.validate(_session_files(presented), presented)
+
+    def test_microsoft_mfa_rejection_is_classified_for_interactive_recovery(self) -> None:
+        tenant = "11111111-1111-1111-1111-111111111111"
+        presented = _test_token(tenant, "22222222-2222-2222-2222-222222222222", marker="old")
+        validator = MicrosoftSessionValidator(
+            {tenant},
+            oauth_exchanger=lambda actual_tenant, refresh, timeout: (_ for _ in ()).throw(
+                OAuthRefreshRejected("AADSTS50078: Presented multi-factor authentication has expired")
+            ),
+        )
+        with self.assertRaises(MicrosoftSessionRejected) as caught:
+            validator.validate(_session_files(presented), presented)
+        self.assertEqual(caught.exception.microsoft_error_code, "AADSTS50078")
+        self.assertTrue(caught.exception.requires_interactive_mfa)
+
+    def test_add_account_retries_once_with_forced_mfa_when_aws_requires_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = AccountStore(Path(temporary))
+            app = TokenPoolApp.__new__(TokenPoolApp)
+            app.store = store
+            app.config = ClientConfig("http://example.invalid", "k" * 32, Path("unused"), "repo")
+            app.log = MagicMock()
+            app._browser_interaction = MagicMock()
+
+            def background(label, work, **kwargs):
+                work()
+                return True
+
+            app._background = background
+
+            def initialized(session, profile, expected_account=None):
+                return (
+                    ClientAccount(
+                        account_id="account-test",
+                        username="tester@mazars.fr",
+                        tenant_id="tenant",
+                        object_id="object",
+                        session_dir=str(session),
+                        profile_dir=str(profile),
+                        access_expires_at=9999999999,
+                        authorization_expires_at=9999999999,
+                    ),
+                    {},
+                )
+
+            mfa_error = ServerRejectedError(
+                400,
+                {
+                    "error": "invalid_bundle",
+                    "microsoft_error_code": "AADSTS50078",
+                    "action": "interactive_mfa_required",
+                },
+            )
+            with patch("token_pool_client.app.bootstrap.bootstrap_api_session"), patch(
+                "token_pool_client.app.bootstrap.renew_microsoft_session"
+            ) as renew, patch(
+                "token_pool_client.app.initialize_refresh", side_effect=initialized
+            ), patch(
+                "token_pool_client.app.create_bundle", return_value=b"bundle"
+            ), patch(
+                "token_pool_client.app.upload_bundle", side_effect=[mfa_error, {"ok": True}]
+            ) as upload:
+                app.add_account()
+
+            self.assertEqual(upload.call_count, 2)
+            self.assertTrue(renew.call_args.kwargs["force_mfa"])
+            self.assertEqual(store.load()[0].username, "tester@mazars.fr")
 
     def test_client_bundle_contains_only_runtime_material(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
