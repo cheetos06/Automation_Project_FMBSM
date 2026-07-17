@@ -28,6 +28,36 @@ function Write-LauncherLog([string]$Message) {
     Write-Host "[FMBSM] $Message"
 }
 
+function Start-ClientProcess(
+    [string]$Executable,
+    [string]$WorkingDirectory,
+    [switch]$RunInBackground,
+    [switch]$VerifyRunning
+) {
+    $StartParameters = @{
+        FilePath = $Executable
+        WorkingDirectory = $WorkingDirectory
+    }
+    if ($RunInBackground) {
+        $StartParameters.ArgumentList = @("--background")
+    }
+    if (-not $VerifyRunning) {
+        Start-Process @StartParameters
+        return
+    }
+    for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+        $Process = Start-Process @StartParameters -PassThru
+        Start-Sleep -Milliseconds 1500
+        if (-not $Process.HasExited) {
+            Write-LauncherLog "Relaunched Token Pool Client process $($Process.Id) on attempt $Attempt."
+            return
+        }
+        Write-LauncherLog "Token Pool Client restart attempt $Attempt exited immediately; retrying."
+        Start-Sleep -Seconds 1
+    }
+    throw "The updated Token Pool Client did not remain running after 3 restart attempts."
+}
+
 function Move-DirectoryWithRetry([string]$Source, [string]$Destination) {
     for ($Attempt = 1; $Attempt -le 20; $Attempt++) {
         try {
@@ -606,11 +636,11 @@ try {
     }
     if (-not $InstallOnly) {
         $Executable = Join-Path $AppPath "app\TokenPoolClient.exe"
-        if ($Background) {
-            Start-Process -FilePath $Executable -ArgumentList "--background" -WorkingDirectory (Join-Path $AppPath "app")
-        } else {
-            Start-Process -FilePath $Executable -WorkingDirectory (Join-Path $AppPath "app")
-        }
+        Start-ClientProcess `
+            -Executable $Executable `
+            -WorkingDirectory (Join-Path $AppPath "app") `
+            -RunInBackground:$Background `
+            -VerifyRunning:($WaitForProcessId -gt 0)
     }
 } catch {
     Write-LauncherLog "Update failed: $($_.Exception.Message)"
@@ -619,11 +649,11 @@ try {
         $Executable = Join-Path ([string]$Fallback.path) "app\TokenPoolClient.exe"
         if (Test-Path $Executable) {
             if (-not $InstallOnly) {
-                if ($Background) {
-                    Start-Process -FilePath $Executable -ArgumentList "--background" -WorkingDirectory (Split-Path $Executable)
-                } else {
-                    Start-Process -FilePath $Executable -WorkingDirectory (Split-Path $Executable)
-                }
+                Start-ClientProcess `
+                    -Executable $Executable `
+                    -WorkingDirectory (Split-Path $Executable) `
+                    -RunInBackground:$Background `
+                    -VerifyRunning:($WaitForProcessId -gt 0)
             }
             exit 0
         }

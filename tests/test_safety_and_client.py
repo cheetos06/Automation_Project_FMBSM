@@ -35,6 +35,7 @@ from token_pool_client.automation import (  # noqa: E402
     configured_refresh_times,
     is_automatic_work_account,
     latest_due_slot,
+    restart_after_exit,
     slot_key,
 )
 from token_pool_client.app import (  # noqa: E402
@@ -647,6 +648,31 @@ class ClientBundleTests(unittest.TestCase):
         flush.assert_called_once_with(app.config)
         restart.assert_called_once_with(app.store.root)
         app.root.after.assert_called_once_with(0, app.shutdown)
+
+    def test_restart_handoff_uses_powershell_start_process_trampoline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            launcher = root / "Launch-TokenPoolClient.ps1"
+            launcher.write_text("param()\n", encoding="utf-8")
+            completed = SimpleNamespace(returncode=0)
+            with patch(
+                "token_pool_client.automation.subprocess.CREATE_NO_WINDOW",
+                0,
+                create=True,
+            ), patch(
+                "token_pool_client.automation.subprocess.run",
+                return_value=completed,
+            ) as run:
+                restart_after_exit(root, process_id=12345)
+
+            command = run.call_args.args[0]
+            options = run.call_args.kwargs
+            self.assertIn("-EncodedCommand", command)
+            handoff = json.loads(options["env"]["FMBSM_RESTART_ARGUMENTS"])
+            self.assertIn("-WaitForProcessId", handoff)
+            self.assertEqual(handoff[-1], "12345")
+            self.assertIn(f'"{launcher.resolve()}"', handoff)
+            self.assertEqual(options["timeout"], 15)
 
     def test_expired_spa_refresh_token_requires_real_sign_in(self) -> None:
         self.assertTrue(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -245,7 +246,7 @@ def restart_after_exit(root: Path | None = None, *, process_id: int | None = Non
     launcher = install_root / "Launch-TokenPoolClient.ps1"
     if not launcher.exists():
         raise RuntimeError("The installed launcher is missing")
-    command = [
+    launcher_command = [
         "powershell.exe",
         "-NoProfile",
         "-ExecutionPolicy",
@@ -253,14 +254,29 @@ def restart_after_exit(root: Path | None = None, *, process_id: int | None = Non
         "-WindowStyle",
         "Hidden",
         "-File",
-        str(launcher),
+        f'"{launcher}"',
         "-Background",
         "-WaitForProcessId",
         str(process_id or os.getpid()),
     ]
-    subprocess.Popen(
-        command,
+    # A directly detached child can still be terminated with the GUI process by
+    # some corporate Windows job policies.  Ask a short-lived PowerShell process
+    # to create the real launcher with Start-Process, then wait until that handoff
+    # has completed before the client exits.
+    environment = dict(os.environ)
+    environment["FMBSM_RESTART_ARGUMENTS"] = json.dumps(launcher_command[1:])
+    bootstrap = """
+$arguments = ConvertFrom-Json $env:FMBSM_RESTART_ARGUMENTS
+Start-Process -FilePath 'powershell.exe' -ArgumentList @($arguments) -WindowStyle Hidden
+""".strip()
+    encoded = base64.b64encode(bootstrap.encode("utf-16-le")).decode("ascii")
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-EncodedCommand", encoded],
         cwd=str(install_root),
-        close_fds=True,
-        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+        env=environment,
+        check=False,
+        timeout=15,
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
+    if completed.returncode != 0:
+        raise RuntimeError(f"Could not schedule client restart (exit code {completed.returncode})")
