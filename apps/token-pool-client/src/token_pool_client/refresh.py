@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -20,6 +21,8 @@ from .storage import ClientAccount
 CLIENT_ID = "4765445b-32c6-49b0-83e6-1d93765276ca"
 SCOPE = "https://substrate.office.com/sydney/.default openid profile offline_access"
 SPA_AUTHORIZATION_LIFETIME_SECONDS = 24 * 60 * 60
+_OAUTH_ROUTE_LOCK = threading.Lock()
+_OAUTH_ROUTE_CACHE: dict[str, bool] = {}
 
 
 class RefreshError(RuntimeError):
@@ -166,20 +169,80 @@ def oauth_refresh(refresh_token: str, tenant: str) -> dict[str, Any]:
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            detail = json.loads(exc.read().decode("utf-8"))
-        except Exception:
-            detail = {}
-        message = detail.get("error_description") or detail.get("error") or str(exc)
-        raise RefreshError(f"Microsoft refresh failed: {str(message)[:500]}") from exc
+    status, payload = _oauth_json(request, timeout_seconds=45)
+    if status < 200 or status >= 300:
+        message = payload.get("error_description") or payload.get("error") or f"HTTP {status}"
+        raise RefreshError(f"Microsoft refresh failed: {str(message)[:500]}")
     access_token = str(payload.get("access_token") or "")
     if not access_token:
         raise RefreshError("Microsoft refresh returned no access token")
     return payload
+
+
+def _oauth_json(
+    request: urllib.request.Request,
+    *,
+    timeout_seconds: float,
+) -> tuple[int, dict[str, Any]]:
+    """Call Microsoft directly first, then retry through the configured proxy.
+
+    Edge and Python do not share one networking stack. In particular, toggling a
+    phone/mobile proxy in Windows does not change HTTP_PROXY inherited by an
+    already-running client. Rebuilding the request and trying both routes keeps a
+    successful browser capture usable even when that inherited proxy is stale.
+    """
+
+    url = request.full_url
+    original_headers = dict(request.header_items())
+    original_body = request.data
+    original_method = request.get_method()
+    with _OAUTH_ROUTE_LOCK:
+        preferred = _OAUTH_ROUTE_CACHE.get(url, False)
+    last_error: BaseException | None = None
+    for index, use_proxy in enumerate((preferred, not preferred)):
+        attempt = urllib.request.Request(
+            url,
+            data=original_body,
+            headers=original_headers,
+            method=original_method,
+        )
+        handlers: list[urllib.request.BaseHandler] = []
+        if not use_proxy:
+            handlers.append(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(*handlers)
+        route_timeout = min(float(timeout_seconds), 12.0) if index == 0 else float(timeout_seconds)
+        try:
+            with opener.open(attempt, timeout=route_timeout) as response:
+                raw = response.read()
+                status = int(getattr(response, "status", 200))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            status = int(exc.code)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                if use_proxy:
+                    last_error = exc
+                    continue
+                raise RefreshError(f"Microsoft OAuth returned non-JSON HTTP {status}") from exc
+            if not isinstance(payload, dict):
+                raise RefreshError("Microsoft OAuth returned an invalid response") from exc
+            with _OAUTH_ROUTE_LOCK:
+                _OAUTH_ROUTE_CACHE[url] = use_proxy
+            return status, payload
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+            continue
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise RefreshError("Microsoft OAuth returned an invalid response") from exc
+        if not isinstance(payload, dict):
+            raise RefreshError("Microsoft OAuth returned an invalid response")
+        with _OAUTH_ROUTE_LOCK:
+            _OAUTH_ROUTE_CACHE[url] = use_proxy
+        return status, payload
+    raise RefreshError(f"Unable to connect to Microsoft OAuth: {last_error}") from last_error
 
 
 def _validate_expected_identity(payload: dict[str, Any], expected: ClientAccount) -> None:

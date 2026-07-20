@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 import zipfile
@@ -33,6 +35,7 @@ from fmbsm_email_bot.worker import _is_authorized_job_sender  # noqa: E402
 from fmbsm_email_bot.zip_utils import safe_extract_files  # noqa: E402
 from token_pool_client.bundle import create_bundle  # noqa: E402
 from token_pool_client import upload as client_upload  # noqa: E402
+from token_pool_client import refresh as client_refresh  # noqa: E402
 from token_pool_client.automation import (  # noqa: E402
     AutomationState,
     configured_refresh_times,
@@ -234,6 +237,39 @@ class ClientBundleTests(unittest.TestCase):
             "invalid",
         ):
             self.assertFalse(is_automatic_work_account(username), username)
+
+    def test_primary_manual_renewal_skips_non_work_accounts(self) -> None:
+        work = ClientAccount(
+            account_id="account-work",
+            username="tester@mazars.fr",
+            tenant_id="tenant",
+            object_id="work",
+            session_dir="work-session",
+            profile_dir="work-profile",
+            access_expires_at=9999999999,
+        )
+        isga = ClientAccount(
+            account_id="account-isga",
+            username="tester@edu.isga.ma",
+            tenant_id="tenant",
+            object_id="isga",
+            session_dir="isga-session",
+            profile_dir="isga-profile",
+            access_expires_at=9999999999,
+        )
+        app = TokenPoolApp.__new__(TokenPoolApp)
+        app.store = MagicMock()
+        app.store.load.return_value = [isga, work]
+        app._renew_and_upload = MagicMock(return_value=RenewalBatchResult(successes=1))
+        app._background = MagicMock(
+            side_effect=lambda label, action, **kwargs: action()
+        )
+
+        app.refresh_all()
+
+        selected = app._renew_and_upload.call_args.args[0]
+        self.assertEqual([account.account_id for account in selected], [work.account_id])
+        self.assertTrue(app._renew_and_upload.call_args.kwargs["automatic"])
 
     def test_automatic_schedule_uses_local_0445_and_0945_slots(self) -> None:
         times = configured_refresh_times("")
@@ -699,6 +735,91 @@ class ClientBundleTests(unittest.TestCase):
         second_request = direct_opener.open.call_args.args[0]
         self.assertIsNot(first_request, second_request)
         self.assertFalse(client_upload._PROXY_ROUTE_CACHE["http://example.invalid"])
+
+    def test_microsoft_oauth_retries_proxy_after_direct_route_failure(self) -> None:
+        direct_opener = MagicMock()
+        direct_opener.open.side_effect = urllib.error.URLError("direct route unavailable")
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = json.dumps(
+            {"access_token": "access", "refresh_token": "refresh"}
+        ).encode("utf-8")
+        proxy_context = MagicMock()
+        proxy_context.__enter__.return_value = response
+        proxy_opener = MagicMock()
+        proxy_opener.open.return_value = proxy_context
+        client_refresh._OAUTH_ROUTE_CACHE.clear()
+
+        with patch(
+            "token_pool_client.refresh.urllib.request.build_opener",
+            side_effect=[direct_opener, proxy_opener],
+        ) as build_opener:
+            payload = client_refresh.oauth_refresh("refresh", "tenant")
+
+        self.assertEqual(payload["access_token"], "access")
+        self.assertEqual(build_opener.call_count, 2)
+        self.assertTrue(client_refresh._OAUTH_ROUTE_CACHE)
+        self.assertTrue(next(iter(client_refresh._OAUTH_ROUTE_CACHE.values())))
+
+    def test_retry_recovers_browser_capture_without_reopening_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = Path(temporary) / "session"
+            profile = Path(temporary) / "profile"
+            session.mkdir()
+            profile.mkdir()
+            converted = session / "private_edge_msal_refresh_token_old.json"
+            converted.write_text("{}", encoding="utf-8")
+            summary = session / "interactive_reauth_new_summary.json"
+            summary.write_text("{}", encoding="utf-8")
+            now = time.time()
+            os.utime(converted, (now - 60, now - 60))
+            os.utime(summary, (now, now))
+            account = ClientAccount(
+                account_id="account-test",
+                username="tester@mazars.fr",
+                tenant_id="tenant",
+                object_id="object",
+                session_dir=str(session),
+                profile_dir=str(profile),
+                access_expires_at=now - 60,
+                authorization_expires_at=now - 60,
+            )
+            renewed = ClientAccount(
+                account_id=account.account_id,
+                username=account.username,
+                tenant_id=account.tenant_id,
+                object_id=account.object_id,
+                session_dir=account.session_dir,
+                profile_dir=account.profile_dir,
+                access_expires_at=now + 3600,
+                authorization_expires_at=now + 23 * 3600,
+            )
+            app = TokenPoolApp.__new__(TokenPoolApp)
+            app.config = ClientConfig("http://example.invalid", "key", Path("unused"), "repo")
+            app.store = MagicMock()
+            app.log = MagicMock()
+            app._fresh_renewal = MagicMock()
+            with patch(
+                "token_pool_client.app.client_preflight",
+                return_value={"ok": True},
+            ), patch(
+                "token_pool_client.app.initialize_refresh",
+                return_value=(renewed, {}),
+            ) as initialize, patch(
+                "token_pool_client.app.create_bundle",
+                return_value=b"bundle",
+            ), patch(
+                "token_pool_client.app.upload_bundle",
+                return_value={"ok": True},
+            ):
+                result = app._renew_and_upload([account], automatic=True)
+
+            self.assertEqual(result.successes, 1)
+            initialize.assert_called_once()
+            app._fresh_renewal.assert_not_called()
+            self.assertTrue(
+                any("already captured" in str(call.args[0]) for call in app.log.call_args_list)
+            )
 
     def test_bootstrap_upload_clicks_only_one_explicit_control(self) -> None:
         page = MagicMock()

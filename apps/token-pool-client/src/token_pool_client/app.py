@@ -161,7 +161,7 @@ class TokenPoolApp:
         controls.pack(fill=X, padx=22, pady=(18, 10))
         self.refresh_button = ttk.Button(
             controls,
-            text="Renew & upload all now",
+            text="Renew work account now",
             style="Primary.TButton",
             command=self.refresh_all,
         )
@@ -410,11 +410,37 @@ class TokenPoolApp:
                         renewed, _ = refresh_existing(renewed)
                     self.log(f"Retrying the pending AWS upload for {account.username} without another sign-in...")
                 else:
-                    renewed = self._fresh_renewal(
-                        account,
-                        automatic=automatic,
-                        allow_visible=allow_visible,
-                    )
+                    captured_at = _unprocessed_browser_capture_at(account)
+                    if captured_at is not None:
+                        self.log(
+                            f"Recovering the Microsoft authorization already captured for {account.username}; "
+                            "Edge will not reopen..."
+                        )
+                        try:
+                            renewed, _ = initialize_refresh(
+                                account.session_path,
+                                account.profile_path,
+                                expected_account=account,
+                            )
+                            renewed.last_uploaded_at = account.last_uploaded_at
+                        except Exception as exc:
+                            if _is_transient_failure(exc):
+                                raise
+                            self.log(
+                                f"The saved capture for {account.username} can no longer be reused; "
+                                "requesting a new authorization..."
+                            )
+                            renewed = self._fresh_renewal(
+                                account,
+                                automatic=automatic,
+                                allow_visible=allow_visible,
+                            )
+                    else:
+                        renewed = self._fresh_renewal(
+                            account,
+                            automatic=automatic,
+                            allow_visible=allow_visible,
+                        )
                 renewed.pending_upload = True
                 renewed.last_error = None
                 self.store.upsert(renewed)
@@ -455,9 +481,13 @@ class TokenPoolApp:
         )
 
     def refresh_all(self) -> None:
-        accounts = self.store.load()
+        accounts = [
+            account
+            for account in self.store.load()
+            if is_automatic_work_account(account.username)
+        ]
         if not accounts:
-            self.log("No account is configured. Choose Add Microsoft account first.")
+            self.log("No @forvismazars.com or @mazars.fr work account is configured.")
             return
 
         def completed(result: object | None, failure: BaseException | None) -> None:
@@ -465,13 +495,14 @@ class TokenPoolApp:
             self._notify_renewal_result(batch, failure=failure)
 
         self._background(
-            "Renewing all accounts...",
+            "Renewing work account...",
             lambda: self._renew_and_upload(
                 accounts,
-                automatic=False,
-                client_event="manual_all_refresh",
+                automatic=True,
+                client_event="manual_work_refresh",
             ),
             on_complete=completed,
+            show_error=False,
         )
 
     def refresh_work_now(self) -> None:
@@ -1144,6 +1175,27 @@ def _authorization_expires_at(account: ClientAccount) -> float | None:
         # token was created at the start of the fixed 24-hour authorization.
         return account.access_expires_at + 23 * 60 * 60
     return None
+
+
+def _unprocessed_browser_capture_at(account: ClientAccount) -> float | None:
+    """Return a captured authorization that never reached OAuth conversion.
+
+    ``renew_microsoft_session`` saves its summary before ``initialize_refresh``
+    exchanges and patches the token. If networking fails between those steps,
+    the summary is newer than every converted OAuth file and the next retry can
+    resume there instead of opening Edge and authorizing again.
+    """
+
+    try:
+        summaries = list(account.session_path.glob("interactive_reauth_*_summary.json"))
+        if not summaries:
+            return None
+        captured_at = max(path.stat().st_mtime for path in summaries)
+        oauth_files = list(account.session_path.glob("private_edge_msal_refresh_token_*.json"))
+        converted_at = max((path.stat().st_mtime for path in oauth_files), default=0.0)
+    except OSError:
+        return None
+    return captured_at if captured_at > converted_at + 0.25 else None
 
 
 def _is_transient_failure(error: BaseException) -> bool:
