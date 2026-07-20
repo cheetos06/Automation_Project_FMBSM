@@ -182,6 +182,25 @@ def _parse_first_json_object(text: str) -> dict[str, Any]:
     raise CopilotRuntimeError("Copilot returned text, but no valid JSON object could be parsed.")
 
 
+def _select_response_text(texts: list[str]) -> str:
+    """Prefer a complete structured answer over longer progress messages.
+
+    Copilot can emit both cumulative answer fragments and localized status text
+    during one turn.  A status such as ``Je travaille sur la generation...``
+    can be longer than the requested JSON, so choosing by length turns a valid
+    response into a parsing failure.  Runtime prompts require JSON; the newest
+    parseable object is therefore the strongest final-answer signal.
+    """
+
+    for text in reversed(texts):
+        try:
+            _parse_first_json_object(text)
+        except CopilotRuntimeError:
+            continue
+        return text
+    return texts[-1]
+
+
 def _signalr_payload(*messages: dict[str, Any]) -> str:
     return "".join(
         json.dumps(message, ensure_ascii=False, separators=(",", ":")) + SIGNALR_RECORD_SEPARATOR
@@ -683,7 +702,7 @@ def _send_turn(ws: websocket.WebSocket, payload_text: str, timeout_seconds: int)
     if not answer_texts:
         detail = f" Last websocket error: {error_message}" if error_message else ""
         raise CopilotRuntimeError(f"No answer text was received from Copilot before timeout.{detail}")
-    return max(answer_texts, key=len), frames
+    return _select_response_text(answer_texts), frames
 
 
 class _SessionBundle:

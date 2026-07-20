@@ -1079,36 +1079,38 @@ def _without_registration_race_duplicates(
 
     A real second installation must not disappear merely because it uses the same
     account or public IP. The old race has a much stronger fingerprint: two IDs
-    share the exact first observation, version, account set, and address, while
-    only one ID is ever seen again.
+    for the same non-empty account set appear within a few milliseconds, while
+    only one ID is ever seen again. Version and remote address are intentionally
+    excluded because the surviving client updates both fields over time.
     """
 
-    def fingerprint(client: dict[str, Any]) -> tuple[object, ...]:
-        return (
-            float(client.get("first_seen_at") or 0.0),
-            str(client.get("app_version") or ""),
-            tuple(str(value) for value in client.get("account_ids") or []),
-            str(client.get("remote_address") or ""),
-        )
+    one_shot_tolerance = 0.001
+    registration_race_window = 0.05
 
-    continued = {
-        fingerprint(client)
-        for client in clients
-        if float(client.get("last_seen_at") or 0.0)
-        > float(client.get("first_seen_at") or 0.0) + 0.001
-    }
-    visible = [
+    def account_set(client: dict[str, Any]) -> tuple[str, ...]:
+        return tuple(sorted(str(value) for value in client.get("account_ids") or []))
+
+    continued = [
         client
         for client in clients
-        if not (
-            fingerprint(client) in continued
-            and abs(
-                float(client.get("last_seen_at") or 0.0)
-                - float(client.get("first_seen_at") or 0.0)
-            )
-            <= 0.001
-        )
+        if float(client.get("last_seen_at") or 0.0)
+        > float(client.get("first_seen_at") or 0.0) + one_shot_tolerance
     ]
+
+    def is_provable_alias(client: dict[str, Any]) -> bool:
+        first_seen = float(client.get("first_seen_at") or 0.0)
+        last_seen = float(client.get("last_seen_at") or 0.0)
+        accounts = account_set(client)
+        if not accounts or abs(last_seen - first_seen) > one_shot_tolerance:
+            return False
+        return any(
+            account_set(survivor) == accounts
+            and abs(float(survivor.get("first_seen_at") or 0.0) - first_seen)
+            <= registration_race_window
+            for survivor in continued
+        )
+
+    visible = [client for client in clients if not is_provable_alias(client)]
     return visible, len(clients) - len(visible)
 
 

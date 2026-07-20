@@ -32,6 +32,7 @@ from copilot_service.token_api import (  # noqa: E402
     TokenApiServer,
     _without_registration_race_duplicates,
 )
+from copilot_runtime.runtime import _select_response_text  # noqa: E402
 from token_pool_client.upload import ClientConfig, client_preflight  # noqa: E402
 from token_pool_client.upload import server_status as client_server_status  # noqa: E402
 from token_pool_client.control import (  # noqa: E402
@@ -99,21 +100,31 @@ def bundle_bytes(
 
 class RegistryTests(unittest.TestCase):
     def test_admin_hides_only_provable_first_run_client_id_alias(self) -> None:
-        shared = {
-            "first_seen_at": 1000.0,
-            "app_version": "1.0.16",
-            "account_ids": ["account-test"],
-            "remote_address": "127.0.0.1",
-        }
         visible, suppressed = _without_registration_race_duplicates(
             [
-                {**shared, "client_id": "winner", "last_seen_at": 1060.0},
-                {**shared, "client_id": "alias", "last_seen_at": 1000.0},
                 {
-                    **shared,
+                    "client_id": "winner",
+                    "first_seen_at": 1000.003,
+                    "last_seen_at": 1060.0,
+                    "app_version": "1.0.18",
+                    "account_ids": ["account-test"],
+                    "remote_address": "198.51.100.20",
+                },
+                {
+                    "client_id": "alias",
+                    "first_seen_at": 1000.0,
+                    "last_seen_at": 1000.0,
+                    "app_version": "1.0.16",
+                    "account_ids": ["account-test"],
+                    "remote_address": "198.51.100.10",
+                },
+                {
                     "client_id": "real-second-computer",
                     "first_seen_at": 1001.0,
                     "last_seen_at": 1001.0,
+                    "app_version": "1.0.18",
+                    "account_ids": ["account-test"],
+                    "remote_address": "198.51.100.30",
                 },
             ]
         )
@@ -121,6 +132,40 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(
             {client["client_id"] for client in visible},
             {"winner", "real-second-computer"},
+        )
+
+    def test_admin_keeps_simultaneous_unmapped_installations(self) -> None:
+        visible, suppressed = _without_registration_race_duplicates(
+            [
+                {
+                    "client_id": "continued",
+                    "first_seen_at": 1000.0,
+                    "last_seen_at": 1060.0,
+                    "account_ids": [],
+                },
+                {
+                    "client_id": "one-shot",
+                    "first_seen_at": 1000.0,
+                    "last_seen_at": 1000.0,
+                    "account_ids": [],
+                },
+            ]
+        )
+        self.assertEqual(suppressed, 0)
+        self.assertEqual(len(visible), 2)
+
+    def test_runtime_prefers_valid_json_over_longer_progress_text(self) -> None:
+        self.assertEqual(
+            _select_response_text(
+                [
+                    '{"',
+                    "pool_health",
+                    '":"ok"}',
+                    '{"pool_health":"ok"}',
+                    "Je travaille sur la generation de la reponse.",
+                ]
+            ),
+            '{"pool_health":"ok"}',
         )
 
     def test_admin_api_retries_directly_when_configured_proxy_is_dead(self) -> None:
