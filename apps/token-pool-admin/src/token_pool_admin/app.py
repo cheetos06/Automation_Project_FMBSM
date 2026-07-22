@@ -331,11 +331,15 @@ class TokenPoolAdminApp:
 
         def work() -> None:
             try:
-                value = snapshot(self.config)
+                refreshed_config = load_config()
+                value = snapshot(refreshed_config)
             except BaseException as exc:
                 self.root.after(0, lambda error=exc: self._refresh_failed(error))
                 return
-            self.root.after(0, lambda: self._apply_snapshot(value))
+            self.root.after(
+                0,
+                lambda: self._apply_snapshot_with_config(value, refreshed_config),
+            )
 
         threading.Thread(target=work, name="token-admin-refresh", daemon=True).start()
 
@@ -344,6 +348,14 @@ class TokenPoolAdminApp:
         self.status_text.set("Server unavailable")
         self.card_server["value"].configure(text="OFFLINE", fg=RED)
         self.card_server["detail"].configure(text=str(error)[:80])
+
+    def _apply_snapshot_with_config(
+        self,
+        value: dict[str, Any],
+        config: AdminConfig,
+    ) -> None:
+        self.config = config
+        self._apply_snapshot(value)
 
     def _apply_snapshot(self, value: dict[str, Any]) -> None:
         self.snapshot_data = value

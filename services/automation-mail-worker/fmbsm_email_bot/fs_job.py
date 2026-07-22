@@ -26,6 +26,7 @@ RESULT_NAMES = {
     "mapper_audit.md",
     "pipeline_report.json",
     "document_review_report.json",
+    "production_quality_summary.txt",
 }
 
 
@@ -90,6 +91,8 @@ def run_fs_review(
         "--year",
         str(year),
     ]
+    if _has_reusable_canonical(ticket_dir):
+        command.append("--reuse-canonical")
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
     environment["PYTHONPATH"] = os.pathsep.join(
@@ -198,6 +201,29 @@ def run_fs_review(
         report_payload = json.loads(report.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"FS pipeline report is unreadable: {exc}") from exc
+    required_results = {
+        "BG_Mapped.xlsx",
+        "FS_Mapped.xlsx",
+        "Document_Review.xlsx",
+        "financial_statements_N_ticked_by_pipeline.pdf",
+        "mapper_audit.md",
+        "pipeline_report.json",
+        "document_review_report.json",
+    }
+    missing_results = sorted(
+        name for name in required_results if not (pipeline_output / name).is_file()
+    )
+    if missing_results:
+        raise RuntimeError(
+            "FS pipeline completed without required production outputs: "
+            + ", ".join(missing_results)
+        )
+    quality_gate = report_payload.get("quality_gate") or {}
+    summary_path = pipeline_output / "production_quality_summary.txt"
+    summary_path.write_text(
+        _quality_summary(report_payload, quality_gate),
+        encoding="utf-8",
+    )
     result_zip = output_dir / f"FS_Review_{job_id}.zip"
     _write_results_zip(pipeline_output, result_zip, log_path)
     if result_zip.stat().st_size > maximum_result_bytes:
@@ -212,6 +238,8 @@ def run_fs_review(
         elapsed_seconds=round(elapsed, 1),
         finished_at=time.time(),
         copilot_call_count=report_payload.get("copilot_call_count"),
+        quality_gate_status=quality_gate.get("status"),
+        quality_gate_reasons=quality_gate.get("reasons", []),
         result_file=result_zip.name,
         result_bytes=result_zip.stat().st_size,
     )
@@ -227,6 +255,46 @@ def _looks_prior(filename: str) -> bool:
         .replace(" ", "_")
     )
     return any(marker in normalized for marker in ("n_1", "n-1", "nminus1", "prior", "previous"))
+
+
+def _has_reusable_canonical(ticket_dir: Path) -> bool:
+    extraction = ticket_dir / "Output" / "extraction"
+    current = extraction / "canonical_N.json"
+    prior_pdf = ticket_dir / "Input" / "financial_statements_N_1.pdf"
+    candidates = [current, *((extraction / "canonical_N_1.json",) if prior_pdf.exists() else ())]
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict) or not isinstance(payload.get("pages"), list):
+            return False
+    return True
+
+
+def _quality_summary(report: dict, quality_gate: dict) -> str:
+    status = str(quality_gate.get("status") or "review")
+    reasons = quality_gate.get("reasons") or []
+    lines = [
+        "FMBSM automated FS review - production quality summary",
+        "",
+        f"Quality gate: {status}",
+        f"Copilot calls in this attempt: {report.get('copilot_call_count', 'unknown')}",
+        f"Elapsed seconds: {report.get('elapsed_seconds', 'unknown')}",
+    ]
+    if reasons:
+        lines.extend(["", "Items requiring attention:", *(f"- {reason}" for reason in reasons)])
+    else:
+        lines.extend(["", "No deterministic quality-gate exception was detected."])
+    lines.extend(
+        [
+            "",
+            "This is an automated review aid. Any item marked review, difference, suspense,",
+            "or missing evidence remains subject to professional validation.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _stage_from_line(line: str) -> str:

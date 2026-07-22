@@ -22,6 +22,10 @@ Page descriptor:
 - Classify scope and page_role using the returned enums.
 - `headings` contains only the visible headings needed to align this page with
   another reporting year.
+- A numbered note, fixed-asset rollforward, amortisation schedule, maturity
+  schedule, or other annex continuation remains `annex_table` even when its
+  row labels resemble Bilan accounts. Use `primary_statement` only for an
+  actual Bilan/Compte de resultat table or its unmistakable continuation.
 
 Review blocks:
 - Extract every meaningful title, heading, paragraph block, date/entity block,
@@ -58,6 +62,8 @@ Primary financial statements:
   parenthetical references printed on subtotal and total rows.
 
 Annex tables:
+- When `page_role` is `annex_table`, `fs_lines` MUST be empty. Put its rows and
+  amounts only in `tables`; do not reinterpret an annex schedule as a Bilan.
 - For each non-primary table, return its title, complete region, and all
   meaningful rows/cells needed to review arithmetic and source support.
 - Give tables and cells stable page-local ids (`t1`, `t1c1`, ...).

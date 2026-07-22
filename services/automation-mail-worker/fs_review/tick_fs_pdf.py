@@ -208,10 +208,43 @@ def add_tick(page: fitz.Page, item: dict[str, Any]) -> None:
         add_suspense(page, x, y, subject, comment)
 
 
-def add_legend(page: fitz.Page) -> None:
+def _legend_box(page: fitz.Page, width: float, height: float) -> fitz.Rect | None:
+    """Find a genuinely blank region; omit the legend if none is available."""
+
+    scale = 0.5
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(scale, scale),
+        colorspace=fitz.csGRAY,
+        alpha=False,
+        annots=False,
+    )
+    samples = pixmap.samples
+    stride = pixmap.stride
+    x_positions = [max(6.0, page.rect.width - width - 6.0), 6.0]
+    y_positions = list(range(6, max(7, int(page.rect.height - height - 5)), 12))
+    for y in y_positions:
+        for left in x_positions:
+            x1 = max(0, int(left * scale))
+            y1 = max(0, int(y * scale))
+            x2 = min(pixmap.width, int((left + width) * scale))
+            y2 = min(pixmap.height, int((y + height) * scale))
+            area = max(1, (x2 - x1) * (y2 - y1))
+            occupied = 0
+            for pixel_y in range(y1, y2):
+                start = pixel_y * stride + x1
+                occupied += sum(value < 248 for value in samples[start : start + (x2 - x1)])
+            if occupied / area <= 0.003:
+                return fitz.Rect(left, float(y), left + width, float(y) + height)
+    return None
+
+
+def add_legend(page: fitz.Page) -> bool:
     width = min(242.0, page.rect.width - 12.0)
-    left = max(6.0, page.rect.width - width - 6.0)
-    box = fitz.Rect(left, 6, left + width, 112)
+    height = 106.0
+    box = _legend_box(page, width, height)
+    if box is None:
+        return False
+    left = box.x0
     page.draw_rect(box, color=RED, width=0.8, overlay=True)
     columns = [
         [
@@ -232,7 +265,7 @@ def add_legend(page: fitz.Page) -> None:
         tick_x = left + 13 + column_index * column_width
         text_x = tick_x + 14
         for row_index, (tickmark, label) in enumerate(entries):
-            y = 23 + row_index * 25
+            y = box.y0 + 17 + row_index * 25
             item = {
                 "tick x": tick_x,
                 "tick y": y,
@@ -251,6 +284,7 @@ def add_legend(page: fitz.Page) -> None:
                 color=(0, 0, 0),
                 overlay=True,
             )
+    return True
 
 
 def tick_pdf(

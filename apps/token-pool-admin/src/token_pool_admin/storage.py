@@ -6,6 +6,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .endpoint_discovery import DEFAULT_REPOSITORY, resolve_endpoint
+
 
 def application_dir() -> Path:
     root = Path(os.getenv("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "FMBSM" / "TokenPoolAdmin"
@@ -24,6 +26,7 @@ class AdminConfig:
     endpoint: str
     admin_key: str
     ca_certificate: Path
+    endpoint_source: str = "configured"
 
 
 def load_config() -> AdminConfig:
@@ -45,8 +48,14 @@ def load_config() -> AdminConfig:
         certificate = path.parent / certificate
     if not certificate.exists():
         raise RuntimeError(f"Pinned server certificate is missing: {certificate}")
+    endpoint, endpoint_source = resolve_endpoint(
+        str(value["endpoint"]),
+        repository=str(value.get("github_repository") or DEFAULT_REPOSITORY),
+        cache_dir=application_dir(),
+    )
     return AdminConfig(
-        endpoint=str(value["endpoint"]).rstrip("/"),
+        endpoint=endpoint,
         admin_key=key,
         ca_certificate=certificate.resolve(),
+        endpoint_source=endpoint_source,
     )

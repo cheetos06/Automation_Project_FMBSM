@@ -144,6 +144,11 @@ class FSLine:
     normalized: str
     summary: bool
     scope: str = ""
+    statement: str = ""
+    statement_family: str = ""
+    result_section: str = ""
+    page: int | None = None
+    canonical_id: str = ""
 
 
 LEGACY_PRESENTATION_MARKERS = (
@@ -310,14 +315,262 @@ def json_lines(data: Any) -> list[dict[str, Any]]:
     return []
 
 
+def statement_family(value: Any) -> str:
+    """Normalize source statement names to accounting presentation families."""
+
+    normalized = normalize_text(value)
+    if "actif" in normalized and "passif" not in normalized:
+        return "asset"
+    if "passif" in normalized:
+        return "liability"
+    if any(
+        marker in normalized
+        for marker in ("compte resultat", "resultat", "produits charges")
+    ):
+        return "result"
+    return ""
+
+
+def infer_statement_families(lines: list[FSLine]) -> None:
+    """Infer sections for legacy flat extracts using their statutory order.
+
+    Current canonical extracts carry an explicit statement name. Historical
+    service-desk fixtures are flat lists, but preserve the PCG order: assets,
+    liabilities/equity, then the income statement. The inference is deliberately
+    based on structural anchors, never on ticket identifiers or amounts.
+    """
+
+    if not lines:
+        return
+
+    # ANC 2016-03 places SCPI assets and negative passifs in one combined
+    # "état du patrimoine".  Preserve that statutory structure instead of
+    # treating the full page as an ordinary asset statement.
+    for line in lines:
+        if "etat patrimoine" not in normalize_text(line.statement):
+            continue
+        label = line.normalized
+        line.statement_family = (
+            "liability"
+            if label.startswith(("dette", "dettes", "total iv", "capitaux propre"))
+            else "asset"
+        )
+
+    if all(line.statement_family for line in lines):
+        return
+
+    def is_liability_start(label: str) -> bool:
+        if "non appele" in label or "non verse" in label:
+            return False
+        return (
+            label == "capital"
+            or label.startswith("capital social")
+            or label.startswith("capital dont verse")
+            or label.startswith("fonds associatif")
+            or label.startswith("fonds propre")
+        )
+
+    def is_result_start(label: str) -> bool:
+        return label.startswith("chiffre affaires") or any(
+            marker in label
+            for marker in (
+                "vente marchandise",
+                "ventes marchandise",
+                "production vente",
+                "chiffre affaires net",
+                "chiffres affaires nets",
+                "montant net chiffre affaires",
+                "produits exploitation",
+                "charges exploitation",
+                "consommations exercice",
+                "achats marchandises",
+                "autres achats charges externes",
+            )
+        )
+
+    liability_start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if not line.statement_family and is_liability_start(line.normalized)
+        ),
+        None,
+    )
+    first_result_start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if not line.statement_family and is_result_start(line.normalized)
+        ),
+        None,
+    )
+    result_search_start = (liability_start + 1) if liability_start is not None else 0
+    result_start = next(
+        (
+            index
+            for index, line in enumerate(lines[result_search_start:], result_search_start)
+            if not line.statement_family and is_result_start(line.normalized)
+        ),
+        None,
+    )
+
+    # A few historical extracts concatenate the income statement before the
+    # balance sheet. Preserve that explicit block rather than assuming that
+    # every flat list is asset/passif/result ordered.
+    if (
+        first_result_start is not None
+        and liability_start is not None
+        and first_result_start < liability_start
+    ):
+        balance_total_start = next(
+            (
+                index
+                for index, line in enumerate(lines[first_result_start:], first_result_start)
+                if "total actif" in line.normalized
+                or "total passif" in line.normalized
+            ),
+            liability_start,
+        )
+        for index, line in enumerate(lines):
+            if line.statement_family:
+                continue
+            if index < balance_total_start:
+                line.statement_family = "result"
+            elif "actif" in line.normalized and "passif" not in line.normalized:
+                line.statement_family = "asset"
+            else:
+                line.statement_family = "liability"
+        return
+
+    # A result-only extract has no equity anchor. Its first recognizable result
+    # line establishes the family for the entire supplied statement.
+    if liability_start is None and result_start is not None:
+        liability_start = 0
+
+    for index, line in enumerate(lines):
+        if line.statement_family:
+            continue
+        if result_start is not None and index >= result_start:
+            line.statement_family = "result"
+        elif liability_start is not None and index >= liability_start:
+            line.statement_family = "liability"
+        else:
+            line.statement_family = "asset"
+
+
+def infer_result_sections(lines: list[FSLine]) -> None:
+    """Infer operating/financial/exceptional/tax blocks from PCG headings."""
+
+    section = ""
+    for line in lines:
+        if line.statement_family != "result":
+            continue
+        if line.result_section:
+            section = line.result_section
+            continue
+        label = line.normalized
+        leading_account = label.split(" ", 1)[0]
+        if leading_account.startswith(("73", "74", "75")):
+            section = "operating"
+        elif leading_account.startswith("76"):
+            section = "financial"
+        elif leading_account.startswith("77"):
+            section = "exceptional"
+        elif any(
+            marker in label
+            for marker in (
+                "exceptionnel",
+                "exceptionnelle",
+                "prod except",
+                "prod excep",
+                "charge except",
+                "charges except",
+                "charg except",
+            )
+        ):
+            section = "exceptional"
+        elif any(
+            marker in label
+            for marker in (
+                "produit financier",
+                "produits financier",
+                "charge financier",
+                "charges financier",
+                "resultat financier",
+                "participation financier",
+                "autres valeurs mobilieres creance actif immobilisation",
+                "autres interet produits assimiles",
+                "interet produit assimile",
+                "interet charge assimile",
+                "difference positive change",
+                "difference negative change",
+                "differences positives change",
+                "differences negatives change",
+            )
+        ) or (
+            label.startswith("participation") and "salarie" not in label
+        ):
+            section = "financial"
+        elif any(
+            marker in label
+            for marker in (
+                "impot benefice",
+                "participation salarie",
+                "participation salaries",
+            )
+        ):
+            section = "tax"
+        elif any(
+            marker in label
+            for marker in (
+                "exploitation",
+                "activite",
+                "vente marchandise",
+                "ventes marchandise",
+                "production vente",
+                "achat marchandise",
+                "achats marchandise",
+                "salaire",
+                "cotisation social",
+            )
+        ):
+            section = "operating"
+        line.result_section = section
+
+
 def load_fs(path: Path) -> list[FSLine]:
     data = json.loads(path.read_text(encoding="utf-8-sig"))
+    source_lines = json_lines(data)
+    scpi_extract = any(
+        "etat patrimoine"
+        in normalize_text(item.get("statement") or item.get("etat") or "")
+        for item in source_lines
+    )
+    scpi_parent_labels = {
+        "immobilisation locatives",
+        "provision liees placements immobilisation",
+        "creance",
+        "valeurs placement disponibilite",
+        "produits immobilisation i",
+        "charge activite immobilisation ii",
+        "produits exploitation i",
+        "charge exploitation ii",
+        "produits financier i",
+        "charge financier ii",
+        "produits exceptionnel i",
+        "charge exceptionnel ii",
+    }
     result: list[FSLine] = []
-    for item in json_lines(data):
+    for item in source_lines:
         label = item.get("libelle") or item.get("label") or item.get("name")
         if not label:
             continue
         normalized = normalize_text(label)
+        source_statement = str(item.get("statement") or item.get("etat") or "")
+        source_section = str(item.get("section") or item.get("result_section") or "")
+        explicit_total = bool(item.get("is_total", item.get("isTotal", False)))
+        forced_detail = scpi_extract and normalized in {"charge exploitation societe"}
+        scpi_parent = scpi_extract and normalized in scpi_parent_labels
         result.append(
             FSLine(
                 label=str(label).strip(),
@@ -330,10 +583,22 @@ def load_fs(path: Path) -> list[FSLine]:
                     item.get("amortissement", item.get("depreciation"))
                 ),
                 normalized=normalized,
-                summary=is_summary_label(normalized),
+                summary=(explicit_total or is_summary_label(normalized) or scpi_parent)
+                and not forced_detail,
                 scope=str(item.get("scope") or ""),
+                statement=source_statement,
+                statement_family=statement_family(source_statement),
+                result_section=normalize_text(source_section),
+                page=(
+                    int(item["page"])
+                    if str(item.get("page", "")).strip().isdigit()
+                    else None
+                ),
+                canonical_id=str(item.get("canonical_id") or ""),
             )
         )
+    infer_statement_families(result)
+    infer_result_sections(result)
     return result
 
 
@@ -492,15 +757,19 @@ def write_audit_report(stats: dict[str, Any], path: Path) -> None:
             "",
             "## FS To BG",
             "",
-            "| FS line | FS amount | BG amount | Difference | Status |",
-            "| --- | ---: | ---: | ---: | --- |",
+            "| FS line | FS amount | BG amount | Difference | Status | Categories | Methods | Confidence | Statement conflicts | Accounts |",
+            "| --- | ---: | ---: | ---: | --- | --- | --- | ---: | --- | --- |",
         ]
     )
     for item in stats["reconciliation"]:
         lines.append(
             f"| {item['fs_line']} | {item['fs_amount']:.2f} | "
             f"{item['bg_amount']:.2f} | {item['difference']:.2f} | "
-            f"{item['status']} |"
+            f"{item['status']} | {', '.join(item.get('categories', []))} | "
+            f"{', '.join(item.get('mapping_methods', []))} | "
+            f"{float(item.get('confidence', 0.0)):.2f} | "
+            f"{', '.join(item.get('conflicting_statement_families', []))} | "
+            f"{', '.join(item.get('participating_accounts', []))} |"
         )
     result_check = stats.get("result_reconciliation")
     if result_check:
@@ -681,13 +950,37 @@ def process_ticket(
         )
     if stats["semantic_matches"]:
         quality_warnings.append(
-            f"{stats['semantic_matches']} BG rows were mapped by accounting "
-            "semantics despite amount differences; review the audit report"
+            f"{stats['semantic_matches']} BG rows were mapped by the permissive "
+            "semantic fallback despite amount differences or compatibility "
+            "warnings; review method, confidence and conflicts in the audit"
+        )
+    permissive_sum_matches = (
+        stats.get("same_statement_permissive_matches", 0)
+        + stats.get("cross_statement_permissive_matches", 0)
+    )
+    if permissive_sum_matches:
+        quality_warnings.append(
+            f"{permissive_sum_matches} BG rows were mapped by the legacy "
+            "equal-sum fallback; cross-statement and low-confidence matches "
+            "must be reviewed using the mapper audit metadata"
         )
     if stats["gross_up_adjustments"]:
         quality_warnings.append(
             "Some FS debit/credit gross balances are only inferred from net "
             "standardized BG accounts and are not directly justified"
+        )
+    if stats.get("fs_framework") == "ifrs_consolidated":
+        quality_warnings.append(
+            "Consolidated/IFRS presentation signatures were detected; permissive "
+            "fallback mappings remain labelled for review and must not be treated "
+            "as accounting-backed evidence"
+        )
+    alignment = stats.get("source_alignment") or {}
+    if alignment.get("status") in {"unproven", "weak"}:
+        quality_warnings.append(
+            "BG/FS source alignment is unproven or weak; permissive mappings are "
+            "still emitted for coverage but their method and confidence require "
+            "manual review"
         )
     stats.update(
         {

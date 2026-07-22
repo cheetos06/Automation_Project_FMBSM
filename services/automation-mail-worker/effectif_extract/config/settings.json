@@ -1,0 +1,16 @@
+{
+  "copilot_registry_db": "",
+  "copilot_accounts_dir": "",
+  "copilot_account_names": [],
+  "copilot_turn_limit_per_account": 150,
+  "copilot_turn_window_seconds": 3600,
+  "copilot_cooldown_seconds": 3600,
+  "dpi": 150,
+  "batch_size": 30,
+  "timeout_seconds": 1200,
+  "copilot_retries": 0,
+  "retry_delay_seconds": 5,
+  "cleanup_rendered_images": true,
+  "prompt_file": "config/prompts/effectif_payroll_v1.md",
+  "sector_rules_file": "config/prompts/effectif_sector_rules_v1.md"
+}

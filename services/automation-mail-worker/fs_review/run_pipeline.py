@@ -6,6 +6,7 @@ import re
 import shutil
 import time
 import unicodedata
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,8 @@ from canonical_extraction import (
     derive_pipeline_artifacts,
     extract_canonical_documents,
 )
-from map_bg_to_fs import process_ticket
+from fs_mapping import write_fs_mapping
+from map_bg_to_fs import load_bg, process_ticket, write_audit_report, write_output
 from run_document_review import run_document_review
 from tick_fs_pdf import tick_pdf
 
@@ -81,6 +83,62 @@ def _statement_scopes(fs_path: Path) -> list[str]:
     return sorted(scopes or {"annual"})
 
 
+def _canonical_reporting_year(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    payload = read_json(path)
+    years: Counter[int] = Counter()
+    for page in payload.get("pages", []) if isinstance(payload, dict) else []:
+        if not isinstance(page, dict):
+            continue
+        match = re.search(r"\b(20\d{2})\b", str(page.get("period_end") or ""))
+        if match:
+            years[int(match.group(1))] += 1
+    return years.most_common(1)[0][0] if years else None
+
+
+def _quality_gate(mapping_reports: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    reasons: list[str] = []
+    metrics: dict[str, Any] = {}
+    review_required = False
+    for scope, report in mapping_reports.items():
+        stats = report.get("stats") or {}
+        bg_total = int(stats.get("nonzero_rows") or 0)
+        bg_matched = int(stats.get("matched_nonzero_rows") or 0)
+        fs_total = int(stats.get("nonzero_fs_leaf_lines") or 0)
+        fs_justified = int(stats.get("justified_nonzero_fs_lines") or 0)
+        bg_coverage = bg_matched / bg_total if bg_total else 0.0
+        fs_coverage = fs_justified / fs_total if fs_total else 0.0
+        metrics[scope] = {
+            "bg_rows": bg_total,
+            "bg_matched": bg_matched,
+            "bg_coverage": round(bg_coverage, 4),
+            "fs_leaf_lines": fs_total,
+            "fs_justified": fs_justified,
+            "fs_coverage": round(fs_coverage, 4),
+        }
+        if not bg_total:
+            review_required = True
+            reasons.append(f"{scope}: no nonzero BG rows were available for reconciliation")
+        elif bg_coverage < 0.8:
+            review_required = True
+            reasons.append(f"{scope}: only {bg_matched}/{bg_total} nonzero BG rows mapped")
+        elif bg_coverage < 0.95:
+            reasons.append(f"{scope}: BG mapping coverage is {bg_coverage:.1%}")
+        if not fs_total:
+            review_required = True
+            reasons.append(f"{scope}: no nonzero detailed FS lines were extracted")
+        elif fs_coverage < 0.5:
+            review_required = True
+            reasons.append(f"{scope}: only {fs_justified}/{fs_total} FS leaf lines were justified")
+        elif fs_coverage < 0.75:
+            reasons.append(f"{scope}: FS justification coverage is {fs_coverage:.1%}")
+        for warning in stats.get("quality_warnings", []) or []:
+            reasons.append(f"{scope}: {warning}")
+    status = "review_required" if review_required else ("pass_with_warnings" if reasons else "pass")
+    return {"status": status, "reasons": reasons, "metrics": metrics}
+
+
 def _write_scoped_json(
     source: Path,
     destination: Path,
@@ -101,6 +159,62 @@ def _write_scoped_json(
     result[item_key] = selected
     result["scope"] = scope
     write_json(destination, result)
+
+
+def _write_no_primary_mapping(
+    *,
+    input_dir: Path,
+    bg_path: Path,
+    bg_mapped_path: Path,
+    fs_mapped_path: Path,
+    audit_path: Path,
+    reporting_year: int,
+) -> dict[str, Any]:
+    """Produce explicit review artifacts for an annex-only document."""
+
+    bg_rows = load_bg(bg_path)
+    write_output(bg_rows, bg_mapped_path)
+    write_fs_mapping([], fs_mapped_path)
+    nonzero_rows = sum(abs(row.amount) > 0.01 for row in bg_rows)
+    stats: dict[str, Any] = {
+        "variant": "official-pcg",
+        "rows": len(bg_rows),
+        "matched": 0,
+        "unmatched": len(bg_rows),
+        "classified": 0,
+        "contextual": 0,
+        "contextual_resolved": 0,
+        "non_fs": 0,
+        "group_matches": 0,
+        "combined_group_matches": 0,
+        "gross_up_matches": 0,
+        "semantic_matches": 0,
+        "gross_up_adjustments": [],
+        "row_matches": 0,
+        "fs_lines": 0,
+        "fs_leaf_lines": 0,
+        "justified_fs_lines": 0,
+        "reconciliation": [],
+        "category_differences": [],
+        "regime": "not_applicable",
+        "ticket": input_dir.parent.name if input_dir.name.lower() == "input" else input_dir.name,
+        "input_dir": str(input_dir),
+        "output": str(bg_mapped_path),
+        "fs_output": str(fs_mapped_path),
+        "matched_nonzero_rows": 0,
+        "nonzero_rows": nonzero_rows,
+        "justified_nonzero_fs_lines": 0,
+        "nonzero_fs_leaf_lines": 0,
+        "quality_warnings": [
+            "No statutory Bilan/CPC pages were found; the document appears to be "
+            "annex-only, so BG-to-FS reconciliation was not attempted"
+        ],
+        "reporting_year": reporting_year,
+        "result_reconciliation": None,
+        "audit_report": str(audit_path),
+    }
+    write_audit_report(stats, audit_path)
+    return stats
 
 
 def _scope_bg_paths(
@@ -401,6 +515,12 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     scopes = _statement_scopes(fs_json)
+    detected_year = _canonical_reporting_year(current_canonical)
+    if detected_year is not None and detected_year != args.year:
+        raise ValueError(
+            f"Subject/config reporting year {args.year} conflicts with the visually detected "
+            f"current reporting year {detected_year}. Resend with year={detected_year}."
+        )
     bg_by_scope = _scope_bg_paths(input_dir, settings, scopes)
     mapping_reports: dict[str, dict[str, Any]] = {}
     fs_mapping_paths: list[Path] = []
@@ -442,17 +562,27 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         bg_mapped_path = scope_output / "BG_Mapped.xlsx"
         fs_mapped_path = scope_output / "FS_Mapped.xlsx"
         audit_path = scope_output / "mapper_audit.md"
-        scope_stats = process_ticket(
-            input_dir,
-            output=bg_mapped_path,
-            fs_override=scoped_fs,
-            reporting_year=args.year,
-            audit_report=audit_path,
-            fs_output=fs_mapped_path,
-            layout_json=scoped_layout,
-            prior_fs_json=scoped_prior,
-            bg_override=bg_by_scope[scope],
-        )
+        if not _items(read_json(scoped_fs), "lines"):
+            scope_stats = _write_no_primary_mapping(
+                input_dir=input_dir,
+                bg_path=bg_by_scope[scope],
+                bg_mapped_path=bg_mapped_path,
+                fs_mapped_path=fs_mapped_path,
+                audit_path=audit_path,
+                reporting_year=args.year,
+            )
+        else:
+            scope_stats = process_ticket(
+                input_dir,
+                output=bg_mapped_path,
+                fs_override=scoped_fs,
+                reporting_year=args.year,
+                audit_report=audit_path,
+                fs_output=fs_mapped_path,
+                layout_json=scoped_layout,
+                prior_fs_json=scoped_prior,
+                bg_override=bg_by_scope[scope],
+            )
         mapping_reports[scope] = {
             "bg": str(bg_by_scope[scope]),
             "bg_mapped": str(bg_mapped_path),
@@ -504,6 +634,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             review_mapping=review_mapping,
         )
 
+    quality_gate = _quality_gate(mapping_reports)
     report = {
         "ticket": str(ticket),
         "input_dir": str(input_dir),
@@ -527,6 +658,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "tick_count": tick_count,
         "document_review": document_review_report,
         "mapper_stats": stats,
+        "reporting_year": args.year,
+        "detected_reporting_year": detected_year,
+        "quality_gate": quality_gate,
         "copilot_call_count": int(canonical_stats.get("vision_calls", 0))
         + int(
             ((document_review_report or {}).get("copilot_stats") or {}).get(

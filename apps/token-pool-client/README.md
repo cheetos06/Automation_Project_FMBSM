@@ -30,6 +30,13 @@ Changes to any other app/service in this monorepo do not trigger a client update
 Downloaded ZIPs are SHA-256 verified and installed under `%LOCALAPPDATA%`; the prior
 working version remains available if an update fails.
 
+The AWS address is also resolved from the public, non-secret
+`deployment/token-pool-endpoint.json` file on GitHub at startup and after each hourly
+update check. The last valid value is cached locally. If the Lightsail public IP
+changes, updating that one JSON file lets installed clients recover even while the
+old AWS address is offline; upload credentials and the encryption certificate never
+come from GitHub.
+
 ## Install and update performance
 
 The visible executable is about 3.45 MB. The first install is larger because account

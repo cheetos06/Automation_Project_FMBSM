@@ -49,6 +49,7 @@ class Settings:
     move_spam_to_inbox: bool
     subject_prefix: str
     fs_subject_prefix: str
+    effectif_subject_prefix: str
     fs_default_year: int
     authorized_job_senders: tuple[str, ...]
     authorized_job_sender_domains: tuple[str, ...]
@@ -66,11 +67,19 @@ class Settings:
     max_zip_files: int
     max_archive_depth: int
     max_messages_per_cycle: int
+    max_queued_jobs: int
+    min_free_disk_bytes: int
+    queue_retry_delay_seconds: int
+    queue_default_fs_seconds: int
+    queue_default_effectif_seconds: int
+    queue_default_signature_seconds: int
+    send_retry_notifications: bool
     max_outbound_emails_per_hour: int
     max_outbound_emails_per_day: int
     max_processing_attempts: int
     extraction_timeout_seconds: int
     fs_review_timeout_seconds: int
+    effectif_timeout_seconds: int
     max_result_attachment_bytes: int
     imap_timeout_seconds: int
     smtp_timeout_seconds: int
@@ -110,6 +119,7 @@ def load_settings() -> Settings:
         move_spam_to_inbox=_get_bool_env("MOVE_SPAM_TO_INBOX", True),
         subject_prefix=os.getenv("SUBJECT_PREFIX", "[optimda-extract-dates]"),
         fs_subject_prefix=os.getenv("FS_SUBJECT_PREFIX", "[fs-review]"),
+        effectif_subject_prefix=os.getenv("EFFECTIF_SUBJECT_PREFIX", "[optimda-effectif]"),
         fs_default_year=_get_int_env("FS_DEFAULT_YEAR", 2025),
         authorized_job_senders=authorized_job_senders,
         authorized_job_sender_domains=authorized_job_sender_domains,
@@ -127,11 +137,23 @@ def load_settings() -> Settings:
         max_zip_files=_get_int_env("MAX_ZIP_FILES", 1000),
         max_archive_depth=_get_int_env("MAX_ARCHIVE_DEPTH", 5),
         max_messages_per_cycle=_get_int_env("MAX_MESSAGES_PER_CYCLE", 10),
+        max_queued_jobs=_get_int_env("MAX_QUEUED_JOBS", 50),
+        min_free_disk_bytes=_get_int_env("MIN_FREE_DISK_BYTES", 2 * 1024 * 1024 * 1024),
+        queue_retry_delay_seconds=_get_int_env("QUEUE_RETRY_DELAY_SECONDS", 30),
+        queue_default_fs_seconds=_get_int_env("QUEUE_DEFAULT_FS_SECONDS", 15 * 60),
+        queue_default_effectif_seconds=_get_int_env(
+            "QUEUE_DEFAULT_EFFECTIF_SECONDS", 15 * 60
+        ),
+        queue_default_signature_seconds=_get_int_env(
+            "QUEUE_DEFAULT_SIGNATURE_SECONDS", 5 * 60
+        ),
+        send_retry_notifications=_get_bool_env("SEND_RETRY_NOTIFICATIONS", True),
         max_outbound_emails_per_hour=_get_int_env("MAX_OUTBOUND_EMAILS_PER_HOUR", 40),
         max_outbound_emails_per_day=_get_int_env("MAX_OUTBOUND_EMAILS_PER_DAY", 200),
         max_processing_attempts=_get_int_env("MAX_PROCESSING_ATTEMPTS", 3),
         extraction_timeout_seconds=_get_int_env("EXTRACTION_TIMEOUT_SECONDS", 300),
         fs_review_timeout_seconds=_get_int_env("FS_REVIEW_TIMEOUT_SECONDS", 3 * 60 * 60),
+        effectif_timeout_seconds=_get_int_env("EFFECTIF_TIMEOUT_SECONDS", 6 * 60 * 60),
         max_result_attachment_bytes=_get_int_env("MAX_RESULT_ATTACHMENT_BYTES", 20 * 1024 * 1024),
         imap_timeout_seconds=_get_int_env("IMAP_TIMEOUT_SECONDS", 30),
         smtp_timeout_seconds=_get_int_env("SMTP_TIMEOUT_SECONDS", 60),

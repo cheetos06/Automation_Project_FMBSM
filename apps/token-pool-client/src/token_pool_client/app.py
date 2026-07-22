@@ -208,7 +208,10 @@ class TokenPoolApp:
     def _load_config(self) -> None:
         try:
             self.config = load_config()
-            self.log(f"Connected configuration: {self.config.endpoint}")
+            self.log(
+                f"Connected configuration: {self.config.endpoint} "
+                f"({self.config.endpoint_source})"
+            )
         except Exception as exc:
             self.log(f"Configuration error: {exc}")
             if not self.background:
@@ -1087,6 +1090,21 @@ class TokenPoolApp:
                     return
                 self.root.after(0, self.shutdown)
             else:
+                previous_endpoint = self.config.endpoint if self.config is not None else ""
+                try:
+                    refreshed = load_config()
+                    self.config = refreshed
+                    if refreshed.endpoint != previous_endpoint:
+                        self.log(
+                            "AWS endpoint recovered from GitHub: "
+                            f"{previous_endpoint or 'unconfigured'} -> {refreshed.endpoint}"
+                        )
+                        self.tray.notify(
+                            "FMBSM endpoint updated",
+                            "The Token Pool Client recovered the current AWS address from GitHub.",
+                        )
+                except Exception as exc:
+                    self.log(f"Endpoint refresh failed; retaining current configuration: {exc}")
                 self.log("No client update is available.")
                 if manual:
                     self.tray.notify("FMBSM client", "The Token Pool Client is already up to date.")

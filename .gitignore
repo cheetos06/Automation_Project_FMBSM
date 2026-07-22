@@ -17,8 +17,14 @@
 **/dist/
 **/release/
 **/release-local*/
+apps/token-pool-*/release-*/
+apps/token-pool-*/r-*/
 **/*.egg-info/
 **/src/token_pool_client/_build_version.py
+
+# Local qualification evidence is retained on the workstation, outside the
+# deployable source history.
+production-readiness/**
 
 # Runtime/session data
 **/data/

@@ -1,0 +1,9 @@
+- Search annexes for effectif, effectif moyen/pondere, nombre de salaries, personnel, ETP and category totals. Prefer the visible exercise-N total.
+- Search CPC/compte de resultat and annexes for charges/frais de personnel, salaires et traitements, remunerations, charges/cotisations sociales, participation/interessement and explicit equivalents.
+- charges_personnel is the visible total personnel expense. Sum components only when the block is clearly defined and all N components are visible.
+- salaires_traitements is the wage/remuneration line; charges_sociales is the employer social-charge line.
+- autres_charges_salariales is only a separately visible employee-related amount not already captured; retain its label in raw_text.
+- Apply explicit equivalent labels in bank, insurance, association, fund and commercial layouts without extracting unrelated expenses.
+- Non-zero personnel, salary/remuneration or social-charge evidence means effectif is not genuinely zero for the period: return false/likely_not_zero unless effectif itself is above zero, then false/reported_nonzero.
+- Explicit zero/no staff plus zero payroll evidence means true/confirmed_zero. With no usable evidence return null/inconclusive.
+- Keep effectif_justification short and cite the decisive N values and pages.

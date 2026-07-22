@@ -5,6 +5,7 @@
   "copilot_turn_limit_per_account": 150,
   "copilot_turn_window_seconds": 3600,
   "copilot_cooldown_seconds": 3600,
+  "copilot_failure_cooldown_seconds": 300,
   "dpi": 180,
   "batch_size": 6,
   "timeout_seconds": 300,

@@ -1,5 +1,6 @@
 {
   "endpoint": "http://35.180.210.11",
   "admin_key": "replace-with-a-dedicated-random-admin-key",
-  "ca_certificate": "server.crt"
+  "ca_certificate": "server.crt",
+  "github_repository": "cheetos06/Automation_Project_FMBSM"
 }

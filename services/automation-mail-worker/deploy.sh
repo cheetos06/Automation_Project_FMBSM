@@ -51,8 +51,10 @@ SERVER_HOST="$3"
 sudo mkdir -p "$REMOTE_DIR"
 sudo chown "$SERVER_USER:$SERVER_USER" "$REMOTE_DIR"
 old_upload_key=""
+old_admin_key=""
 if [[ -f "$REMOTE_DIR/.env" ]]; then
   old_upload_key="$(sed -n 's/^COPILOT_UPLOAD_KEY=//p' "$REMOTE_DIR/.env" | tail -1)"
+  old_admin_key="$(sed -n 's/^TOKEN_ADMIN_KEY=//p' "$REMOTE_DIR/.env" | tail -1)"
 fi
 tar -xzf /tmp/fmbsm-automation.tar.gz -C "$REMOTE_DIR"
 cp /tmp/fmbsm-automation.env "$REMOTE_DIR/.env"
@@ -75,6 +77,14 @@ if [[ ${#incoming_upload_key} -lt 32 || "$incoming_upload_key" == replace-* ]]; 
   fi
   printf 'COPILOT_UPLOAD_KEY=%s\n' "$old_upload_key" >> "$REMOTE_DIR/.env"
 fi
+incoming_admin_key="$(sed -n 's/^TOKEN_ADMIN_KEY=//p' "$REMOTE_DIR/.env" | tail -1)"
+if [[ ${#incoming_admin_key} -lt 32 || "$incoming_admin_key" == replace-* ]]; then
+  sed -i '/^TOKEN_ADMIN_KEY=/d' "$REMOTE_DIR/.env"
+  if [[ ${#old_admin_key} -lt 32 || "$old_admin_key" == replace-* ]]; then
+    old_admin_key="$(openssl rand -hex 32)"
+  fi
+  printf 'TOKEN_ADMIN_KEY=%s\n' "$old_admin_key" >> "$REMOTE_DIR/.env"
+fi
 ensure_env BOT_DATA_DIR "$REMOTE_DIR/data/mail"
 ensure_env COPILOT_DATA_DIR "$REMOTE_DIR/data/copilot"
 ensure_env COPILOT_REGISTRY_DB "$REMOTE_DIR/data/copilot/registry.sqlite3"
@@ -86,7 +96,16 @@ ensure_env TOKEN_API_KEY_FILE "$REMOTE_DIR/data/tls/server.key"
 ensure_env TOKEN_CLIENT_ARTIFACT_DIR "/srv/fmbsm-artifacts/upload/token-client"
 ensure_env FS_SUBJECT_PREFIX "[fs-review]"
 ensure_env FS_REVIEW_TIMEOUT_SECONDS "10800"
+ensure_env EFFECTIF_SUBJECT_PREFIX "[optimda-effectif]"
+ensure_env EFFECTIF_TIMEOUT_SECONDS "21600"
 ensure_env MAX_RESULT_ATTACHMENT_BYTES "20971520"
+ensure_env MAX_QUEUED_JOBS "50"
+ensure_env MIN_FREE_DISK_BYTES "2147483648"
+ensure_env QUEUE_RETRY_DELAY_SECONDS "30"
+ensure_env QUEUE_DEFAULT_FS_SECONDS "900"
+ensure_env QUEUE_DEFAULT_EFFECTIF_SECONDS "900"
+ensure_env QUEUE_DEFAULT_SIGNATURE_SECONDS "300"
+ensure_env SEND_RETRY_NOTIFICATIONS "true"
 chmod 600 "$REMOTE_DIR/.env"
 
 sudo apt-get update
@@ -147,7 +166,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip wheel
 python -m pip install -r requirements.txt
-python -m compileall -q fmbsm_email_bot copilot_service copilot_runtime fs_review
+python -m compileall -q fmbsm_email_bot copilot_service copilot_runtime fs_review effectif_extract
 deactivate
 
 sudo cp systemd/fmbsm-token-api.service /etc/systemd/system/fmbsm-token-api.service

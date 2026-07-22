@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "deployment": "fmbsm-production",
+  "endpoint": "http://35.180.210.11",
+  "updated_at": "2026-07-22T00:00:00Z"
+}

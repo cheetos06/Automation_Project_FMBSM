@@ -40,6 +40,11 @@ Annex evidence rules:
   commitments, ownership, subsidiary figures, tax calculations, or other
   dimensional breakdowns.
 - Arithmetic coherence proves only calculation, not source inputs.
+- Recompute every visible subtotal, total, and rollforward that has enough
+  numeric component cells in the canonical record. Emit `calculation_match`
+  or `calculation_difference` on the exact CURRENT total/closing cell even
+  when the same table also needs external source evidence. Do not replace a
+  calculation result with a table-level evidence requirement.
 - Return evidence requirements only for non-empty current values.
 - Fixed-asset/amortisation movement columns require
   `fixed_asset_rollforward`; receivable aging requires `aged_receivables`;

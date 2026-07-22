@@ -19,20 +19,32 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Resolve public endpoint manifest
+        shell: pwsh
+        run: |
+          $manifest = Get-Content -Raw deployment/token-pool-endpoint.json | ConvertFrom-Json
+          if ($manifest.schema_version -ne 1 -or $manifest.deployment -ne "fmbsm-production") {
+            throw "Invalid token-pool endpoint manifest."
+          }
+          $endpoint = [Uri]([string]$manifest.endpoint)
+          if ($endpoint.Scheme -notin @("http", "https") -or -not $endpoint.Host) {
+            throw "Token-pool endpoint manifest does not contain a valid HTTP(S) origin."
+          }
+          "TOKEN_POOL_PUBLIC_ENDPOINT=$($endpoint.GetLeftPart([UriPartial]::Authority).TrimEnd('/'))" >> $env:GITHUB_ENV
+          "TOKEN_POOL_SSH_HOST=$($endpoint.Host)" >> $env:GITHUB_ENV
       - name: Prepare pinned client configuration
         shell: pwsh
         env:
-          TOKEN_POOL_ENDPOINT: ${{ secrets.TOKEN_POOL_ENDPOINT }}
           TOKEN_POOL_UPLOAD_KEY: ${{ secrets.TOKEN_POOL_UPLOAD_KEY }}
           TOKEN_POOL_CA_CERT_B64: ${{ secrets.TOKEN_POOL_CA_CERT_B64 }}
         run: |
-          if (-not $env:TOKEN_POOL_ENDPOINT -or -not $env:TOKEN_POOL_UPLOAD_KEY -or -not $env:TOKEN_POOL_CA_CERT_B64) {
+          if (-not $env:TOKEN_POOL_UPLOAD_KEY -or -not $env:TOKEN_POOL_CA_CERT_B64) {
             throw "Token client release secrets are not configured."
           }
           $root = "apps/token-pool-client"
           [IO.File]::WriteAllBytes("$root/server.crt", [Convert]::FromBase64String($env:TOKEN_POOL_CA_CERT_B64))
           @{
-            endpoint = $env:TOKEN_POOL_ENDPOINT
+            endpoint = $env:TOKEN_POOL_PUBLIC_ENDPOINT
             upload_key = $env:TOKEN_POOL_UPLOAD_KEY
             ca_certificate = "server.crt"
             github_repository = "cheetos06/Automation_Project_FMBSM"
@@ -41,7 +53,10 @@ jobs:
         shell: pwsh
         run: |
           $version = "1.0.${{ github.run_number }}"
-          ./apps/token-pool-client/build.ps1 -Version $version -RequireRegisteredRuntime
+          ./apps/token-pool-client/build.ps1 `
+            -Version $version `
+            -ArtifactMirrorBaseUrl "$env:TOKEN_POOL_PUBLIC_ENDPOINT/downloads/token-client" `
+            -RequireRegisteredRuntime
           "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
       - name: Smoke-test packaged executable
         shell: pwsh
@@ -97,7 +112,14 @@ jobs:
           known_hosts="$RUNNER_TEMP/token-artifact-known-hosts"
           batch="$RUNNER_TEMP/token-artifact-sftp-batch"
           printf '%s\n' "$TOKEN_ARTIFACT_SFTP_KEY" > "$key"
-          printf '%s\n' "$TOKEN_ARTIFACT_SSH_HOST_KEY" > "$known_hosts"
+          # Preserve the pinned SSH key material while replacing only the
+          # public hostname/IP, which may change when Lightsail is stopped.
+          host_key_material="$(printf '%s\n' "$TOKEN_ARTIFACT_SSH_HOST_KEY" | awk 'NF >= 3 { print $2 " " $3; exit }')"
+          if [[ -z "$host_key_material" ]]; then
+            echo "Token artifact SSH host key is malformed." >&2
+            exit 1
+          fi
+          printf '%s %s\n' "$TOKEN_POOL_SSH_HOST" "$host_key_material" > "$known_hosts"
           chmod 600 "$key" "$known_hosts"
           {
             echo "-mkdir token-client"
@@ -116,4 +138,4 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$known_hosts" \
-            fmbsm-artifacts@35.180.210.11
+            "fmbsm-artifacts@$TOKEN_POOL_SSH_HOST"

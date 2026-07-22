@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .endpoint_discovery import resolve_endpoint
 from .storage import application_dir, executable_dir
 from .transport_crypto import ENVELOPE_CONTENT_TYPE, encrypt_bundle
 
@@ -26,6 +27,7 @@ class ClientConfig:
     upload_key: str
     ca_certificate: Path
     github_repository: str
+    endpoint_source: str = "configured"
 
 
 class TransientNetworkError(RuntimeError):
@@ -90,11 +92,20 @@ def load_config() -> ClientConfig:
         certificate = path.parent / certificate
     if not certificate.exists():
         raise RuntimeError(f"Pinned server certificate is missing: {certificate}")
+    repository = str(
+        value.get("github_repository") or "cheetos06/Automation_Project_FMBSM"
+    )
+    endpoint, endpoint_source = resolve_endpoint(
+        str(value["endpoint"]),
+        repository=repository,
+        cache_dir=application_dir(),
+    )
     return ClientConfig(
-        endpoint=str(value["endpoint"]).rstrip("/"),
+        endpoint=endpoint,
         upload_key=str(value["upload_key"]),
         ca_certificate=certificate.resolve(),
-        github_repository=str(value.get("github_repository") or "cheetos06/Automation_Project_FMBSM"),
+        github_repository=repository,
+        endpoint_source=endpoint_source,
     )
 
 

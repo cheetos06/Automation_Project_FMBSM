@@ -36,6 +36,11 @@ FS_OUTPUT_HEADERS = [
     "supporting BG labels",
     "tick x",
     "tick y",
+    "mapping method",
+    "mapping confidence",
+    "mapping amount difference",
+    "conflicting statement families",
+    "participating BG categories",
 ]
 
 CONTRA_ASSET_PREFIXES = ("28", "29", "39", "49", "59")
@@ -450,6 +455,11 @@ def build_fs_mapping_rows(
         line_index = mapper.row_line_indexes.get(id(row))
         if line_index is not None:
             rows_by_line[line_index].append((row_index, row))
+    reconciliation_by_line = {
+        int(item["fs_line_index"]): item
+        for item in stats.get("reconciliation", [])
+        if item.get("fs_line_index") is not None
+    }
 
     output: list[dict[str, Any]] = []
     for entry in layout:
@@ -459,6 +469,7 @@ def build_fs_mapping_rows(
         if match is None:
             continue
         line_index, line = match
+        audit = reconciliation_by_line.get(line_index, {})
         fs_amount = _line_field_amount(line, field)
         if fs_amount is None:
             continue
@@ -572,6 +583,15 @@ def build_fs_mapping_rows(
                 "supporting BG labels": labels,
                 "tick x": entry.get("x"),
                 "tick y": entry.get("y"),
+                "mapping method": ", ".join(audit.get("mapping_methods", [])),
+                "mapping confidence": audit.get("confidence"),
+                "mapping amount difference": audit.get("amount_difference"),
+                "conflicting statement families": ", ".join(
+                    audit.get("conflicting_statement_families", [])
+                ),
+                "participating BG categories": ", ".join(
+                    audit.get("participating_categories", [])
+                ),
             }
         )
     return output
@@ -603,6 +623,11 @@ def write_fs_mapping(rows: list[dict[str, Any]], path: Path) -> None:
         "M": 70,
         "N": 10,
         "O": 10,
+        "P": 32,
+        "Q": 20,
+        "R": 24,
+        "S": 34,
+        "T": 42,
     }
     for column, width in widths.items():
         sheet.column_dimensions[column].width = width

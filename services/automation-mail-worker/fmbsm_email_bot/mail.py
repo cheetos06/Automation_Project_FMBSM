@@ -34,6 +34,26 @@ class InboundEmail:
     bot_generated: bool
 
 
+def parse_inbound_email(*, raw: bytes, mailbox: str, uid: str) -> InboundEmail:
+    """Rebuild a queued message from its durable RFC-822 copy."""
+
+    message = BytesParser(policy=policy.default).parsebytes(raw)
+    return InboundEmail(
+        mailbox=mailbox,
+        uid=uid,
+        raw=raw,
+        message=message,
+        subject=_header_to_str(message.get("subject")),
+        sender=parseaddr(_header_to_str(message.get("from")))[1],
+        reply_to=parseaddr(
+            _header_to_str(message.get("reply-to") or message.get("from"))
+        )[1],
+        message_id=_header_to_str(message.get("message-id")).strip(),
+        references=_header_to_str(message.get("references")).strip(),
+        bot_generated=_is_bot_generated(message),
+    )
+
+
 class GmailClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -51,6 +71,7 @@ class GmailClient:
                 search_terms = _unread_subject_search_terms(
                     self.settings.subject_prefix,
                     self.settings.fs_subject_prefix,
+                    self.settings.effectif_subject_prefix,
                 )
                 status, data = imap.uid("SEARCH", None, *search_terms)
                 self._require_ok(status, f"search unread trigger emails in {mailbox}")
@@ -61,23 +82,7 @@ class GmailClient:
                     status, fetch_data = imap.uid("FETCH", uid, "(BODY.PEEK[])")
                     self._require_ok(status, f"fetch email UID {uid} from {mailbox}")
                     raw = _extract_raw_message(fetch_data)
-                    message = BytesParser(policy=policy.default).parsebytes(raw)
-                    messages.append(
-                        InboundEmail(
-                            mailbox=mailbox,
-                            uid=uid,
-                            raw=raw,
-                            message=message,
-                            subject=_header_to_str(message.get("subject")),
-                            sender=parseaddr(_header_to_str(message.get("from")))[1],
-                            reply_to=parseaddr(
-                                _header_to_str(message.get("reply-to") or message.get("from"))
-                            )[1],
-                            message_id=_header_to_str(message.get("message-id")).strip(),
-                            references=_header_to_str(message.get("references")).strip(),
-                            bot_generated=_is_bot_generated(message),
-                        )
-                    )
+                    messages.append(parse_inbound_email(raw=raw, mailbox=mailbox, uid=uid))
             return messages
 
     def mark_seen(self, uid: str, mailbox: str | None = None) -> None:

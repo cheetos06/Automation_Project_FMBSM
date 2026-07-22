@@ -197,6 +197,7 @@ def run_document_review(args: argparse.Namespace) -> dict[str, Any]:
     write_json(alignment_path, alignment)
 
     comparisons: list[dict[str, Any]] = []
+    current_canonical: dict[str, Any] | None = None
     prior_index = read_json(prior_index_path) if prior_pdf else None
     groups = _groups(alignment, current_index, prior_index)
     copilot_stats: dict[str, Any] = {}
@@ -301,6 +302,7 @@ def run_document_review(args: argparse.Namespace) -> dict[str, Any]:
             scope: path.resolve()
             for scope, path in (getattr(args, "bg_by_scope", None) or {}).items()
         },
+        current_canonical=current_canonical,
     )
     workbook_path = output_dir / "Document_Review.xlsx"
     review_json_path = extraction_dir / "document_review.json"

@@ -181,6 +181,180 @@ def _specialized_source(table_title: Any, source: str, bg_support: str) -> tuple
     return source, None
 
 
+def _arithmetic_close(expected: float, actual: float) -> bool:
+    tolerance = max(2.0, 0.001 * max(abs(expected), abs(actual), 1.0))
+    return abs(expected - actual) <= tolerance
+
+
+def _calculation_review_row(
+    *,
+    page: int,
+    scope: str,
+    label: str,
+    cell: dict[str, Any],
+    expected: float,
+    actual: float,
+    page_sizes: dict[int, tuple[float, float]],
+) -> dict[str, Any] | None:
+    normalized = _bbox(cell.get("bbox_norm"))
+    if normalized is None or page not in page_sizes:
+        return None
+    width, height = page_sizes[page]
+    region = _points(normalized, width, height)
+    tick_x, tick_y = _tick_anchor(region, width, height)
+    matched = _arithmetic_close(expected, actual)
+    # A structured extraction may omit a component or expose an intermediate
+    # subtotal without labelling it as such. Deterministically certify exact
+    # visible arithmetic, but leave apparent differences to the semantic
+    # review instead of creating a potentially false exception.
+    if not matched:
+        return None
+    return {
+        "page": page,
+        "scope": scope,
+        "review kind": "calculation_match",
+        "label": _repair_mojibake(label),
+        "prior page": "",
+        "status": "reviewed",
+        "tickmark": "calculation",
+        "comment": f"Calcul arithmétique cohérent ({actual:.2f}).",
+        "evidence": "Recalcul déterministe des cellules visibles du tableau.",
+        "required source": "",
+        "tick x": tick_x,
+        "tick y": tick_y,
+        "region x1": None,
+        "region y1": None,
+        "region x2": None,
+        "region y2": None,
+    }
+
+
+def _deterministic_arithmetic_rows(
+    canonical: dict[str, Any] | None,
+    page_sizes: dict[int, tuple[float, float]],
+) -> list[dict[str, Any]]:
+    """Recompute annex totals and rollforwards without model judgment."""
+
+    if not canonical:
+        return []
+    result: list[dict[str, Any]] = []
+    seen_cells: set[str] = set()
+    for page_data in canonical.get("pages", []):
+        if page_data.get("page_role") == "primary_statement":
+            continue
+        try:
+            page = int(page_data["page"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        scope = str(page_data.get("scope") or "other")
+        for table in page_data.get("tables", []):
+            table_title = str(table.get("title") or "Tableau annexe")
+            table_rows = [row for row in table.get("rows", []) if isinstance(row, dict)]
+            section_start = 0
+            previous_total = -1
+            for index, row in enumerate(table_rows):
+                label = str(row.get("label") or "")
+                folded_label = _fold(label)
+                is_total = "total" in folded_label
+                if folded_label.startswith("total"):
+                    if "general" in folded_label:
+                        components = [
+                            candidate
+                            for candidate in table_rows[section_start:index]
+                            if "total" in _fold(candidate.get("label"))
+                            and "general" not in _fold(candidate.get("label"))
+                        ]
+                    else:
+                        components = [
+                            candidate
+                            for candidate in table_rows[previous_total + 1 : index]
+                            if "total" not in _fold(candidate.get("label"))
+                        ]
+                    for total_cell in row.get("cells", []):
+                        actual = total_cell.get("amount")
+                        column = _fold(total_cell.get("column_label"))
+                        if actual is None or not column:
+                            continue
+                        values = [
+                            float(cell["amount"])
+                            for candidate in components
+                            for cell in candidate.get("cells", [])
+                            if cell.get("amount") is not None
+                            and _fold(cell.get("column_label")) == column
+                        ]
+                        if len(values) < 2:
+                            continue
+                        cell_id = str(total_cell.get("id") or "")
+                        row_result = _calculation_review_row(
+                            page=page,
+                            scope=scope,
+                            label=f"{table_title} - {label} - {total_cell.get('column_label')}",
+                            cell=total_cell,
+                            expected=sum(values),
+                            actual=float(actual),
+                            page_sizes=page_sizes,
+                        )
+                        if row_result:
+                            result.append(row_result)
+                            seen_cells.add(cell_id)
+                if is_total:
+                    previous_total = index
+                if "total general" in folded_label:
+                    section_start = index + 1
+
+                cells = [
+                    cell
+                    for cell in row.get("cells", [])
+                    if cell.get("amount") is not None
+                ]
+                opening = next(
+                    (cell for cell in cells if cell.get("support_type") == "opening_balance"),
+                    None,
+                )
+                closing = next(
+                    (cell for cell in cells if cell.get("support_type") == "closing_balance"),
+                    None,
+                )
+                movements = [
+                    cell for cell in cells if cell.get("support_type") == "movement"
+                ]
+                closing_id = str((closing or {}).get("id") or "")
+                if not opening or not closing or not movements or closing_id in seen_cells:
+                    continue
+                expected = float(opening["amount"])
+                understood = 0
+                for movement in movements:
+                    column = _fold(movement.get("column_label"))
+                    amount = float(movement["amount"])
+                    if any(
+                        marker in column
+                        for marker in ("diminution", "reprise", "cession", "sortie")
+                    ):
+                        expected -= abs(amount)
+                        understood += 1
+                    elif any(
+                        marker in column
+                        for marker in ("augmentation", "dotation", "acquisition", "entree")
+                    ):
+                        expected += amount
+                        understood += 1
+                if understood != len(movements):
+                    continue
+                row_result = _calculation_review_row(
+                    page=page,
+                    scope=scope,
+                    label=f"{table_title} - {label} - rollforward",
+                    cell=closing,
+                    expected=expected,
+                    actual=float(closing["amount"]),
+                    page_sizes=page_sizes,
+                )
+                if row_result:
+                    result.append(row_result)
+                    seen_cells.add(closing_id)
+    return result
+
+
 def build_review_rows(
     comparisons: Iterable[dict[str, Any]],
     *,
@@ -189,6 +363,7 @@ def build_review_rows(
     available_sources: set[str] | None = None,
     bg_path: Path | None = None,
     bg_paths: dict[str, Path] | None = None,
+    current_canonical: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     available = set(available_sources or {"bg", "prior_fs"})
     document = fitz.open(current_pdf)
@@ -411,6 +586,7 @@ def build_review_rows(
                 }
             )
 
+    rows.extend(_deterministic_arithmetic_rows(current_canonical, page_sizes))
     return _deduplicate(rows)
 
 

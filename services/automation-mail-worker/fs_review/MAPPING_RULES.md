@@ -11,13 +11,18 @@ year. Historical FAST mappings are not runtime inputs or rules.
 
 ## Processing Order
 
-1. Validate that the BG and FS refer to a compatible entity and period.
-2. Exclude empty and zero-value BG rows from material reconciliation.
-3. Aggregate repeated rows by accounting-account identity before using sign.
-4. Classify accounts by PCG family, label, sign, and presentation regime.
-5. Match classifications to available detailed FS lines.
-6. Reconcile all BG accounts composing each FS line, allowing minor rounding.
-7. Leave ambiguous rows blank and report source or extraction differences.
+1. Apply direct exact accounting mappings.
+2. Apply named, authorized accounting composites.
+3. Prove derived result, account-coded, and repeated disclosure lines.
+4. Apply exact single-row fallback mappings.
+5. Search remaining lines for same-statement equal-sum combinations.
+6. Search remaining lines for cross-statement equal-sum combinations.
+7. Apply permissive semantic mappings to any remaining classified BG rows.
+
+The first three stages are the accounting-backed layer. Later permissive
+stages restore the historical coverage-first behavior and never conceal their
+method, confidence, amount difference, participating accounts/categories, or
+statement-family conflicts.
 
 ## Core Accounting Logic
 
@@ -41,6 +46,19 @@ year. Historical FAST mappings are not runtime inputs or rules.
   they belong to the same economic line.
 - Operating, financial, exceptional, participation, and tax accounts are
   classified by economic nature, not merely by the first digit.
+- Financial assets distinguish participations and related receivables, portfolio
+  activity securities, other fixed securities, loans, and other financial
+  assets according to the PCG account-to-statement passage.
+- External charges retain useful PCG subfamilies (rentals, insurance, fees,
+  travel, banking services, and others) for detailed presentations, then
+  recombine on the standard `Autres achats et charges externes` line.
+- Exceptional management items, asset disposals, dotations, and reversals stay
+  distinct when the statement displays them separately.
+- In the legacy PCG model, `675` and capital-nature `678` charges compose
+  `Charges exceptionnelles sur operations en capital`; `775` and the
+  capital-nature residual exceptional-income family compose the corresponding
+  products line. This rule is limited to the legacy presentation and requires
+  exact reconciliation. It is not carried into the modern 2025 presentation.
 
 ## Contextual Accounts
 
@@ -55,14 +73,24 @@ Some accounts cannot be mapped safely from their prefix alone:
 - Custom subaccounts and entity-specific labels may require AI or reviewer
   reasoning.
 
-An amount coincidence cannot override an incompatible accounting category.
+An amount coincidence cannot override an incompatible accounting category in
+the accounting-backed stages. The explicit permissive stages may still emit
+that candidate for review.
 
 ## FS Safeguards
 
-- Map to detailed leaf lines, not totals, subtotals, calculated results, or
-  duplicate headings.
-- Accept many BG accounts for one FS line only when their composition is
-  accounting-compatible.
+- Prefer detailed leaf lines over totals, subtotals, calculated results, or
+  duplicate headings. An exceptional or financial total may be used only when
+  it is the sole available presentation line and the complete authorized
+  category composition reconciles exactly.
+- Prefer named presentation rules for multi-category lines. Remaining exact
+  sums may be emitted by `exact_amount_combination`, `permissive_equal_sum`, or
+  `cross_statement_equal_sum` after the accounting-backed stages are exhausted.
+- Generic words such as `autres`, `dettes`, `créances`, `charges`, and
+  `produits` cannot by themselves establish a mapping.
+- Accounting-backed mappings do not cross asset, liability/equity, and result
+  statements or result sections. The final permissive fallbacks may cross
+  those boundaries, but the conflict is retained in the audit output.
 - Use a small rounding tolerance, but do not hide material differences.
 - A certain account destination may remain mapped when the BG demonstrates
   that the published FS amount is wrong; the audit report labels this as a
@@ -85,15 +113,19 @@ is required.
 
 Reference sources:
 
-- French PCG published by the Autorite des normes comptables.
+- [French PCG 2024 published by the Autorite des normes comptables](https://www.anc.gouv.fr/files/anc/files/1_Normes_fran%C3%A7aises/Reglements/Recueils/PCG_Janvier2024/PCG--1er-janvier-2024.pdf).
+- [DGFiP 2053 model and official notice](https://www.impots.gouv.fr/sites/default/files/formulaires/2032-not-sd/2025/2032-not-sd_5014.pdf).
+- [DGFiP BOFiP treatment of legacy exceptional charges](https://bofip.impots.gouv.fr/bofip/1800-PGP.html/identifiant=BOI-BIC-CHG-60-10-20120912).
 - ANC regulation 2022-06 and its commented account-to-statement passage tables.
 
 ## Reliability Boundary
 
 Deterministic mapping is appropriate when account family, sign, label, FS line,
-and amount composition agree. Use AI or human review for ambiguous custom
-labels, incomplete FS extraction, gross/net information loss, regime ambiguity,
-or material BG/FS contradictions.
+and amount composition agree. Treat `permissive_equal_sum`,
+`cross_statement_equal_sum`, and `semantic_permissive` as review candidates,
+not accounting-backed conclusions. Ambiguous custom labels, incomplete FS
+extraction, gross/net information loss, regime ambiguity, and material BG/FS
+contradictions require reviewer judgment.
 
 ## FS Review And Tickmarks
 
@@ -107,6 +139,11 @@ or material BG/FS contradictions.
   explainable, but a standardized net collective account cannot reproduce the
   FS gross debit/credit presentation by itself. It remains an `Ecart a
   remonter` and receives the red cross.
+
+It also appends mapping method, confidence, amount difference, conflicting
+statement families, participating BG categories, and supporting BG accounts.
+The same structured fields are present in `pipeline_report.json` under the
+mapper reconciliation/audit records and in the Markdown mapper audit.
 
 The PDF tickmark script never discovers amount positions from hidden PDF text.
 Coordinates must come from a visual extraction saved in

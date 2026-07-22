@@ -46,6 +46,9 @@ def run_account_pool(
     registry = CopilotRegistry.from_env()
     turn_limit = max(1, int(settings.get("copilot_turn_limit_per_account", 150)))
     cooldown_seconds = max(1.0, float(settings.get("copilot_cooldown_seconds", 3600)))
+    failure_cooldown_seconds = max(
+        5.0, float(settings.get("copilot_failure_cooldown_seconds", 300))
+    )
     window_seconds = max(60.0, float(settings.get("copilot_turn_window_seconds", 3600)))
     job_id = str(settings.get("_job_id") or "") or None
     operation_name = getattr(operation, "__name__", "copilot_call")
@@ -63,10 +66,13 @@ def run_account_pool(
             "requeued": 0,
             "cooldowns": 0,
             "cooldown_wait_seconds": 0.0,
+            "account_errors": 0,
         }
         for account in accounts
     }
     errors: list[BaseException] = []
+    account_failures: list[str] = []
+    attempted_accounts: dict[int, set[str]] = {index: set() for index in range(len(jobs))}
     state_changed = threading.Condition()
     stop = threading.Event()
     remaining = len(jobs)
@@ -82,6 +88,8 @@ def run_account_pool(
                 index, job = pending.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if index < 0:
+                return
 
             allowed, wait_seconds, reason, turn_count = registry.reserve_turn(
                 account.name,
@@ -95,8 +103,9 @@ def run_account_pool(
                 pending.put((index, job))
                 if reason in {"missing", "disabled"}:
                     with state_changed:
-                        errors.append(RuntimeError(f"Copilot account {account.name} became {reason}"))
-                        stop.set()
+                        account_failures.append(
+                            f"Copilot account {account.name} became {reason}"
+                        )
                         state_changed.notify_all()
                     return
                 wait_started = time.perf_counter()
@@ -148,8 +157,38 @@ def run_account_pool(
                     )
                     continue
                 with state_changed:
-                    errors.append(exc)
-                    stop.set()
+                    attempted_accounts[index].add(account.name)
+                    stats[account.name]["account_errors"] = int(
+                        stats[account.name]["account_errors"]
+                    ) + 1
+                    stats[account.name]["requeued"] = int(stats[account.name]["requeued"]) + 1
+                    account_failures.append(
+                        f"{account.name}: {type(exc).__name__}: {str(exc)[:500]}"
+                    )
+                    if len(attempted_accounts[index]) >= len(accounts):
+                        errors.append(
+                            RuntimeError(
+                                "Copilot request failed independently on every available account: "
+                                + " | ".join(account_failures[-len(accounts) :])
+                            )
+                        )
+                        stop.set()
+                    else:
+                        registry.start_cooldown(
+                            account.name,
+                            seconds=failure_cooldown_seconds,
+                            reason="account_error",
+                            error=str(exc),
+                        )
+                        stats[account.name]["cooldowns"] = int(
+                            stats[account.name]["cooldowns"]
+                        ) + 1
+                        pending.put((index, job))
+                        print(
+                            f"[copilot-pool] account error account={account.name}; "
+                            f"request requeued cooldown={failure_cooldown_seconds:.0f}s",
+                            flush=True,
+                        )
                     state_changed.notify_all()
                 return
 
@@ -159,6 +198,11 @@ def run_account_pool(
                     results[index] = result
                     remaining -= 1
                     stats[account.name]["jobs"] = int(stats[account.name]["jobs"]) + 1
+                    if remaining == 0:
+                        # Wake peers blocked in Queue.get immediately. Without
+                        # sentinels every pool run pays the get timeout once.
+                        for _ in accounts:
+                            pending.put((-1, job))
                 stats[account.name]["seconds"] = round(float(stats[account.name]["seconds"]) + elapsed, 3)
                 state_changed.notify_all()
 
@@ -175,7 +219,11 @@ def run_account_pool(
     if errors:
         raise errors[0]
     if any(result is None for result in results):
-        raise RuntimeError("Copilot account pool ended before all jobs completed")
+        detail = " | ".join(account_failures[-10:])
+        raise RuntimeError(
+            "Copilot account pool ended before all jobs completed"
+            + (f": {detail}" if detail else "")
+        )
     return PoolRun(
         results=[result for result in results if result is not None],
         account_stats=stats,

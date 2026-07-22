@@ -284,6 +284,20 @@ def resolve_comparison_targets(
                 resolved_item["row_label"] = cell.get("row_label")
             items.append(resolved_item)
         resolved_requirement["items"] = items
+        item_boxes = [
+            box
+            for item in items
+            if (box := _bbox(item.get("bbox_norm"))) is not None
+        ]
+        if item_boxes:
+            evidence_box = (
+                min(box[0] for box in item_boxes),
+                min(box[1] for box in item_boxes),
+                max(box[2] for box in item_boxes),
+                max(box[3] for box in item_boxes),
+            )
+            resolved_requirement["bbox_norm"] = list(evidence_box)
+            resolved_requirement["tick_anchor_norm"] = _right_middle(evidence_box)
         requirements.append(resolved_requirement)
 
     removed = []
@@ -348,6 +362,27 @@ def run_structured_review(
     batches = _batches(jobs, max_jobs=max_jobs, max_chars=max_chars)
     prompt = prompt_path(settings, "canonical_compare_prompt")
 
+    def cached_batch(batch_job: dict[str, Any]) -> dict[str, Any] | None:
+        batch_number = int(batch_job["batch"])
+        path = (
+            runs_dir
+            / f"batch_{batch_number:03d}"
+            / f"canonical_review_batch_{batch_number:03d}_parsed.json"
+        )
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        returned_ids = {
+            str(item.get("job_id"))
+            for item in _comparison_items(parsed)
+            if item.get("job_id")
+        }
+        required_ids = {str(item["job_id"]) for item in batch_job["jobs"]}
+        if not required_ids.issubset(returned_ids):
+            return None
+        return {"batch": batch_number, "parsed": parsed}
+
     def operation(
         batch_job: dict[str, Any], account_settings: dict[str, Any], account_name: str
     ) -> dict[str, Any]:
@@ -373,9 +408,17 @@ def run_structured_review(
         {"batch": index, "jobs": batch}
         for index, batch in enumerate(batches, start=1)
     ]
-    pool: PoolRun[dict[str, Any]] = run_account_pool(pool_jobs, settings, operation)
+    cached_results = [value for job in pool_jobs if (value := cached_batch(job)) is not None]
+    missing_pool_jobs = [job for job in pool_jobs if cached_batch(job) is None]
+    if cached_results:
+        print(
+            f"[document-review] resuming with {len(cached_results)} cached structured "
+            f"batch(es); {len(missing_pool_jobs)} remain",
+            flush=True,
+        )
+    pool: PoolRun[dict[str, Any]] = run_account_pool(missing_pool_jobs, settings, operation)
     returned: dict[str, dict[str, Any]] = {}
-    for result in pool.results:
+    for result in [*cached_results, *pool.results]:
         for item in _comparison_items(result["parsed"]):
             if item.get("job_id"):
                 returned[str(item["job_id"])] = item
@@ -390,15 +433,18 @@ def run_structured_review(
             {"batch": len(batches) + index, "jobs": [job]}
             for index, job in enumerate(missing, start=1)
         ]
+        cached_retry = [value for job in retry_jobs if (value := cached_batch(job)) is not None]
+        missing_retry_jobs = [job for job in retry_jobs if cached_batch(job) is None]
         retry_pool: PoolRun[dict[str, Any]] = run_account_pool(
-            retry_jobs, settings, operation
+            missing_retry_jobs, settings, operation
         )
         retry_stats = {
-            "calls": len(retry_jobs),
+            "calls": len(missing_retry_jobs),
+            "cached_calls": len(cached_retry),
             "elapsed_seconds": round(retry_pool.elapsed_seconds, 3),
             "accounts": retry_pool.account_stats,
         }
-        for result in retry_pool.results:
+        for result in [*cached_retry, *retry_pool.results]:
             for item in _comparison_items(result["parsed"]):
                 if item.get("job_id"):
                     returned[str(item["job_id"])] = item
@@ -417,8 +463,9 @@ def run_structured_review(
         comparisons.append(resolved)
 
     stats = {
-        "semantic_calls": len(pool_jobs) + int(retry_stats["calls"]),
+        "semantic_calls": len(missing_pool_jobs) + int(retry_stats["calls"]),
         "semantic_batches": len(pool_jobs),
+        "cached_semantic_batches": len(cached_results) + int(retry_stats.get("cached_calls", 0)),
         "elapsed_seconds": round(
             pool.elapsed_seconds + float(retry_stats["elapsed_seconds"]), 3
         ),

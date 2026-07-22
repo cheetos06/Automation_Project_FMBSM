@@ -30,3 +30,8 @@ The private `admin-config.json` and server certificate are excluded from Git. Th
 same credential must later be installed as `TOKEN_ADMIN_KEY` on AWS during the
 approved deployment; until then, the local admin app correctly reports that the
 live admin API is unavailable.
+
+The app refreshes the public AWS endpoint from
+`deployment/token-pool-endpoint.json` on GitHub and caches the last valid value.
+Changing the Lightsail IP therefore requires editing only that non-secret manifest;
+the private administrator key and pinned certificate remain local.

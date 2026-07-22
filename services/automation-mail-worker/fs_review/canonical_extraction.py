@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import math
+import json
+import re
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +48,12 @@ VALID_BLOCK_KINDS = {
     "other",
 }
 FS_FIELDS = {"brut", "amortissement", "montant_n", "montant_n_1"}
+
+
+def _fold(value: Any) -> str:
+    text = unicodedata.normalize("NFKD", _text(value))
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text.lower())).strip()
 
 
 def _page_count(pdf: Path) -> int:
@@ -279,6 +288,210 @@ def _normalize_page(
     }
 
 
+def _move_fs_lines_to_table(
+    page: dict[str, Any],
+    *,
+    role: str,
+    scope: str | None,
+    suffix: str,
+    note: str,
+) -> None:
+    fs_lines = [line for line in page.get("fs_lines", []) if isinstance(line, dict)]
+    boxes = [
+        box
+        for line in fs_lines
+        for box in [
+            _bbox(line.get("label_bbox_norm")),
+            *[_bbox(cell.get("bbox_norm")) for cell in line.get("cells", [])],
+        ]
+        if box is not None
+    ]
+    table_box = (
+        [
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        ]
+        if boxes
+        else None
+    )
+    rows = []
+    for line in fs_lines:
+        rows.append(
+            {
+                "label": line.get("libelle"),
+                "cells": [
+                    {
+                        "id": cell.get("id"),
+                        "column_label": cell.get("display_column")
+                        or cell.get("field"),
+                        "text": None,
+                        "amount": cell.get("amount"),
+                        "bbox_norm": cell.get("bbox_norm"),
+                        "support_type": "other",
+                    }
+                    for cell in line.get("cells", [])
+                ],
+            }
+        )
+    if rows:
+        page.setdefault("tables", []).append(
+            {
+                "id": (
+                    f"{page.get('period_role', 'N')}:p{page.get('page')}:{suffix}"
+                ),
+                "title": page.get("primary_title") or "Tableau reclassé",
+                "bbox_norm": table_box,
+                "rows": rows,
+            }
+        )
+    page["page_role"] = role
+    page["statement_kind"] = None
+    page["fs_lines"] = []
+    if scope is not None:
+        page["scope"] = scope
+    page.setdefault("quality_notes", []).append(note)
+
+
+def _reclassify_secondary_statement_pages(
+    canonical: dict[str, Any],
+) -> dict[str, Any]:
+    """Exclude management-detail and tax-form replicas from FS mapping."""
+
+    tax_section = False
+    pages = sorted(
+        (page for page in canonical.get("pages", []) if isinstance(page, dict)),
+        key=lambda page: int(page.get("page") or 0),
+    )
+    for page in pages:
+        descriptor = _fold(
+            " ".join(
+                [
+                    str(page.get("primary_title") or ""),
+                    *[str(value) for value in page.get("headings", [])],
+                    *[
+                        str(block.get("text") or "")
+                        for block in page.get("blocks", [])
+                        if isinstance(block, dict)
+                    ],
+                ]
+            )
+        )
+        if page.get("page_role") == "cover":
+            if "etats fiscaux" in descriptor:
+                tax_section = True
+            elif any(
+                marker in descriptor
+                for marker in (
+                    "annexe aux comptes",
+                    "etats de gestion",
+                    "details de comptes",
+                    "comptes annuels",
+                )
+            ):
+                tax_section = False
+        if tax_section:
+            page["scope"] = "tax"
+        if page.get("page_role") != "primary_statement":
+            continue
+        if tax_section:
+            _move_fs_lines_to_table(
+                page,
+                role="tax_form",
+                scope="tax",
+                suffix="tax_form_reclassified",
+                note=(
+                    "Primary-looking table reclassified as a tax form because it "
+                    "belongs to the ETATS FISCAUX section."
+                ),
+            )
+        elif "detaille" in descriptor or "soldes intermediaires de gestion" in descriptor:
+            _move_fs_lines_to_table(
+                page,
+                role="annex_table",
+                scope=None,
+                suffix="management_detail_reclassified",
+                note=(
+                    "Detailed/management statement excluded from primary FS mapping "
+                    "to avoid duplicating the statutory summary statements."
+                ),
+            )
+    return canonical
+
+
+def _reclassify_suspicious_primary_pages(
+    canonical: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep annex schedules from leaking into Bilan/CPC mapping.
+
+    A page rendered without its surrounding pages can resemble a primary
+    statement when it is actually a continuation of a numbered annex table.
+    Reclassification is deliberately narrow: it requires an annex cover,
+    no other confidently titled primary statement, no visible primary title
+    on the candidate, and very sparse numeric FS cells.
+    """
+
+    pages = [page for page in canonical.get("pages", []) if isinstance(page, dict)]
+    annex_cover = any(
+        "annexe" in _fold(
+            " ".join(
+                [
+                    str(page.get("primary_title") or ""),
+                    *[str(value) for value in page.get("headings", [])],
+                    *[
+                        str(block.get("text") or "")
+                        for block in page.get("blocks", [])
+                        if isinstance(block, dict)
+                    ],
+                ]
+            )
+        )
+        for page in pages[:3]
+    )
+    confident_primary = any(
+        page.get("page_role") == "primary_statement"
+        and any(
+            marker in _fold(
+                " ".join(
+                    [
+                        str(page.get("primary_title") or ""),
+                        *[str(value) for value in page.get("headings", [])],
+                    ]
+                )
+            )
+            for marker in ("bilan actif", "bilan passif", "compte de resultat")
+        )
+        for page in pages
+    )
+    if not annex_cover or confident_primary:
+        return canonical
+
+    for page in pages:
+        if page.get("page_role") != "primary_statement" or page.get("primary_title"):
+            continue
+        fs_lines = [line for line in page.get("fs_lines", []) if isinstance(line, dict)]
+        numeric_lines = sum(
+            any(cell.get("amount") is not None for cell in line.get("cells", []))
+            for line in fs_lines
+        )
+        if not fs_lines or numeric_lines > max(3, len(fs_lines) // 5):
+            continue
+
+        _move_fs_lines_to_table(
+            page,
+            role="annex_table",
+            scope=None,
+            suffix="annex_reclassified",
+            note=(
+                "Page reclassified from primary statement to annex table because "
+                "the document is annex-only and the untitled schedule has sparse "
+                "numeric cells."
+            ),
+        )
+    return canonical
+
+
 def extract_canonical_documents(
     documents: dict[str, Path],
     *,
@@ -287,7 +500,7 @@ def extract_canonical_documents(
     settings: dict[str, Any],
     page_selection: dict[str, list[int]] | None = None,
 ) -> dict[str, Any]:
-    jobs = [
+    all_jobs = [
         {"period_role": period_role, "pdf": pdf, "page": page}
         for period_role, pdf in documents.items()
         for page in (
@@ -296,6 +509,38 @@ def extract_canonical_documents(
             else range(1, _page_count(pdf) + 1)
         )
     ]
+    jobs: list[dict[str, Any]] = []
+    cached_pages: list[dict[str, Any]] = []
+    for job in all_jobs:
+        period_role = str(job["period_role"])
+        page = int(job["page"])
+        cache_path = (
+            runs_dir
+            / period_role
+            / f"page_{page}"
+            / f"canonical_{period_role}_page_{page}_parsed.json"
+        )
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            cached = None
+        if isinstance(cached, dict):
+            cached_pages.append(
+                _normalize_page(
+                    cached,
+                    page=page,
+                    period_role=period_role,
+                    source=Path(job["pdf"]),
+                )
+            )
+        else:
+            jobs.append(job)
+    if cached_pages:
+        print(
+            f"[canonical] resuming with {len(cached_pages)} cached page(s); "
+            f"{len(jobs)} page call(s) remain",
+            flush=True,
+        )
     prompt = prompt_path(settings, "canonical_page_prompt")
 
     def operation(
@@ -330,7 +575,7 @@ def extract_canonical_documents(
     pages_by_period: dict[str, list[dict[str, Any]]] = {
         period_role: [] for period_role in documents
     }
-    for page in pool.results:
+    for page in [*cached_pages, *pool.results]:
         pages_by_period[str(page["period_role"])].append(page)
 
     for period_role, pages in pages_by_period.items():
@@ -345,6 +590,8 @@ def extract_canonical_documents(
 
     return {
         "vision_calls": len(jobs),
+        "total_vision_pages": len(all_jobs),
+        "cached_vision_pages": len(cached_pages),
         "elapsed_seconds": round(pool.elapsed_seconds, 3),
         "accounts": pool.account_stats,
         "documents": {key: str(value) for key, value in output_paths.items()},
@@ -462,6 +709,8 @@ def derive_pipeline_artifacts(
     import json
 
     canonical = json.loads(canonical_path.read_text(encoding="utf-8-sig"))
+    canonical = _reclassify_secondary_statement_pages(canonical)
+    canonical = _reclassify_suspicious_primary_pages(canonical)
     canonical = refine_canonical_document(canonical, pdf_path=pdf_path)
     write_json(canonical_path, canonical)
     source = str(pdf_path)
