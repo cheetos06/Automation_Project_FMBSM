@@ -22,7 +22,9 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install -r services/automation-mail-worker/requirements.txt "playwright>=1.61,<2" "pytest>=8,<9"
       - name: Unit tests
-        run: python -m unittest discover -s tests -v
+        env:
+          PYTHONPATH: services/automation-mail-worker:services/automation-mail-worker/fs_review
+        run: python -m pytest -q
       - name: Reject committed private runtime files
         shell: bash
         run: |
