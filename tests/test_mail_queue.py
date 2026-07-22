@@ -137,6 +137,45 @@ class DurableQueueTests(unittest.TestCase):
 
             self.assertGreaterEqual(snapshot["estimated_completion_seconds"], 900)
 
+    def test_slowest_recent_success_raises_queue_estimate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = MessageStore(root / "processed_messages.json")
+            store._data["messages"].update(
+                {
+                    "fast": {
+                        "status": "processed",
+                        "job_kind": "fs_review",
+                        "duration_seconds": 120,
+                        "finished_at": "2026-07-22T08:00:00+00:00",
+                    },
+                    "slow": {
+                        "status": "processed",
+                        "job_kind": "fs_review",
+                        "duration_seconds": 1_514,
+                        "finished_at": "2026-07-22T09:00:00+00:00",
+                    },
+                }
+            )
+            raw = root / "queued.eml"
+            raw.write_bytes(b"message")
+            store.mark_queued(
+                "queued",
+                uid="queued",
+                mailbox="INBOX",
+                subject="subject",
+                job_id="queued-job",
+                job_kind="fs_review",
+                raw_path=raw,
+            )
+
+            snapshot = store.queue_snapshot(
+                "queued",
+                default_seconds={"fs_review": 900},
+            )
+
+            self.assertGreaterEqual(snapshot["estimated_completion_seconds"], 1_514)
+
     def test_enqueue_saves_rfc822_before_ack_and_reports_queue(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

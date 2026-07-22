@@ -344,11 +344,12 @@ class MessageStore:
         return {
             # Historical samples refine the estimate upward, but never let a
             # handful of unusually fast jobs undercut the configured service
-            # time. Queue acknowledgements should be conservative promises.
+            # time. Use the slowest recent successful job because queue
+            # acknowledgements should be conservative promises, not medians.
             kind: max(
                 30,
                 int(default),
-                int(round(statistics.median(values))) if values else 0,
+                int(round(max(values))) if values else 0,
             )
             for kind, default in defaults.items()
             for values in (samples.get(kind, []),)
