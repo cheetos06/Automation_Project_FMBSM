@@ -72,6 +72,7 @@ class GmailClient:
                     self.settings.subject_prefix,
                     self.settings.fs_subject_prefix,
                     self.settings.effectif_subject_prefix,
+                    self.settings.balance_subject_prefix,
                 )
                 status, data = imap.uid("SEARCH", None, *search_terms)
                 self._require_ok(status, f"search unread trigger emails in {mailbox}")

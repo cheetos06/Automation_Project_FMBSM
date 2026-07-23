@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -20,6 +21,7 @@ for candidate in (str(SERVICE), str(FS_REVIEW)):
         sys.path.insert(0, candidate)
 
 from copilot_service.job_status import JobStatusStore  # noqa: E402
+from fmbsm_email_bot.config import load_settings  # noqa: E402
 from fmbsm_email_bot.mail import parse_inbound_email  # noqa: E402
 from fmbsm_email_bot.state import MessageStore  # noqa: E402
 from fmbsm_email_bot.worker import (  # noqa: E402
@@ -46,6 +48,25 @@ class FakeMailClient:
         return None
 
 
+class SettingsTests(unittest.TestCase):
+    def test_bot_address_is_added_without_replacing_configured_senders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env_file = Path(temp) / ".env"
+            env_file.write_text(
+                "GMAIL_ADDRESS=bot@example.com\n"
+                "GMAIL_APP_PASSWORD=test-password\n"
+                "AUTHORIZED_JOB_SENDERS=person@example.com\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"ENV_FILE": str(env_file)}, clear=True):
+                settings = load_settings()
+
+        self.assertEqual(
+            settings.authorized_job_senders,
+            ("person@example.com", "bot@example.com"),
+        )
+
+
 def queue_settings(root: Path):
     return SimpleNamespace(
         jobs_dir=root / "jobs",
@@ -59,8 +80,10 @@ def queue_settings(root: Path):
         queue_default_fs_seconds=900,
         queue_default_effectif_seconds=900,
         queue_default_signature_seconds=300,
+        queue_default_balance_seconds=900,
         fs_subject_prefix="[fs-review]",
         effectif_subject_prefix="[optimda-effectif]",
+        balance_subject_prefix="[balance-cleaner]",
         subject_prefix="[optimda-extract-dates]",
         max_processing_attempts=3,
     )

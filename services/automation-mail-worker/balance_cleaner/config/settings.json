@@ -1,0 +1,17 @@
+{
+  "copilot_registry_db": "",
+  "copilot_accounts_dir": "",
+  "copilot_account_names": [],
+  "copilot_turn_limit_per_account": 150,
+  "copilot_turn_window_seconds": 3600,
+  "copilot_cooldown_seconds": 3600,
+  "copilot_failure_cooldown_seconds": 300,
+  "timeout_seconds": 1200,
+  "cleanup_rendered_images": true,
+  "rows_per_image": 30,
+  "batch_size": 10,
+  "max_estimated_records_per_request": 120,
+  "image_max_width": 12000,
+  "libreoffice_bin": "libreoffice",
+  "prompt_file": "config/prompts/balance_extract_v1.md"
+}

@@ -136,10 +136,10 @@ def _prepare_input_image(input_path: Path, work_dir: Path, prefix: str, page: in
     raise ValueError(f"Unsupported input type: {input_path.suffix}. Use a PDF or image.")
 
 
-def _json_object_candidates(text: str) -> list[str]:
+def _json_value_candidates(text: str) -> list[str]:
     candidates: list[str] = []
     start: int | None = None
-    depth = 0
+    stack: list[str] = []
     in_string = False
     escape = False
     for index, char in enumerate(text):
@@ -153,33 +153,46 @@ def _json_object_candidates(text: str) -> list[str]:
             continue
         if char == '"':
             in_string = True
-        elif char == "{":
-            if depth == 0:
+        elif char in "[{":
+            if not stack:
                 start = index
-            depth += 1
-        elif char == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start is not None:
-                    candidates.append(text[start : index + 1])
-                    start = None
+            stack.append(char)
+        elif char in "]}":
+            if not stack:
+                continue
+            expected = "]" if stack[-1] == "[" else "}"
+            if char != expected:
+                start = None
+                stack.clear()
+                continue
+            stack.pop()
+            if not stack and start is not None:
+                candidates.append(text[start : index + 1])
+                start = None
     return candidates
 
 
-def _parse_first_json_object(text: str) -> dict[str, Any]:
+def _parse_first_json_value(text: str) -> dict[str, Any] | list[Any]:
     stripped = text.strip()
     if stripped.startswith("```"):
         stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
         stripped = re.sub(r"\s*```$", "", stripped)
-    candidates = [stripped, *_json_object_candidates(stripped)]
+    candidates = [stripped, *_json_value_candidates(stripped)]
     for candidate in candidates:
         try:
             parsed = json.loads(candidate)
         except Exception:
             continue
-        if isinstance(parsed, dict):
+        if isinstance(parsed, (dict, list)):
             return parsed
-    raise CopilotRuntimeError("Copilot returned text, but no valid JSON object could be parsed.")
+    raise CopilotRuntimeError("Copilot returned text, but no valid JSON object or array could be parsed.")
+
+
+def _parse_first_json_object(text: str) -> dict[str, Any]:
+    parsed = _parse_first_json_value(text)
+    if isinstance(parsed, dict):
+        return parsed
+    raise CopilotRuntimeError("Copilot returned JSON, but the response was not an object.")
 
 
 def _select_response_text(texts: list[str]) -> str:
@@ -194,7 +207,7 @@ def _select_response_text(texts: list[str]) -> str:
 
     for text in reversed(texts):
         try:
-            _parse_first_json_object(text)
+            _parse_first_json_value(text)
         except CopilotRuntimeError:
             continue
         return text
@@ -995,7 +1008,7 @@ class CopilotRuntime:
                 except Exception:
                     pass
 
-        parsed = _parse_first_json_object(raw_response)
+        parsed = _parse_first_json_value(raw_response)
         metadata["raw_response"] = raw_response
         metadata["parsed"] = parsed
         metadata["websocket_frame_count"] = len(websocket_frames)

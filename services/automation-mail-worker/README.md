@@ -9,6 +9,12 @@ and two session-upload transports: pinned HTTPS and proxy-compatible encrypted H
 - `[optimda-effectif]` extracts only effectif and payroll evidence (charges de
   personnel, salaires et traitements, charges sociales, and equivalents) into one
   Excel workbook. A failed PDF is recorded as an error row without stopping the job.
+- `[balance-cleaner]` accepts Excel trial balances (`.xlsx`, `.xlsm`, `.xls`, or
+  `.xlsb`, including safe ZIP/7z archives), renders the most populated worksheet in
+  consecutive 100-row images through its actual last populated row, sends at most 30
+  images per Copilot request, and returns a cleaned three-column Excel workbook. It
+  recognizes localized debit/credit/net-balance equivalents and normalizes the signed
+  result as debit minus credit (or preserves a directly supplied net balance).
 - `[fs-review]` runs the financial-statement review framework. Attach
   `financial_statements_N.pdf`, optional `financial_statements_N_1.pdf`, and
   `bg_standardized.xlsx`. Add `year=2025` to the subject to override the default year.
@@ -40,6 +46,15 @@ At least one allowlist must be configured or the worker refuses to start. Matchi
 case-insensitive and exact: allowing `mazars.fr` does not allow a subdomain or a name
 such as `mazars.fr.attacker.example`. Unauthorized matching messages are marked read
 without starting a job or sending a reply.
+The configured `GMAIL_ADDRESS` is also added to the exact-address allowlist after this
+fail-closed check, which permits controlled bot-to-itself end-to-end tests. Replies
+emitted by the bot carry a loop-protection header and are never queued as new jobs.
+
+Run a live balance-cleaner loop test with:
+
+```bash
+python scripts/send-balance-cleaner-test.py --env services/automation-mail-worker/.env --workbook path/to/balance.xlsx
+```
 
 ## Shared Copilot pool
 
