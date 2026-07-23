@@ -19,10 +19,19 @@ for candidate in (str(SERVICE), str(FS_REVIEW)):
     if candidate not in sys.path:
         sys.path.insert(0, candidate)
 
-from balance_cleaner.render import _font, _text_width, _wrap, capture_workbook  # noqa: E402
+from balance_cleaner.render import (  # noqa: E402
+    _font,
+    _text_width,
+    _wrap,
+    capture_workbook,
+    select_capture_columns,
+)
 from balance_cleaner.run_pipeline import (  # noqa: E402
     _batch_prompt,
     _extract_records,
+    _extract_schema,
+    _reconcile_account_numbers,
+    _schema_prompt,
     _write_workbook,
     chunk_screenshots,
 )
@@ -151,11 +160,100 @@ class BalanceRendererTests(unittest.TestCase):
                 99,
             )
 
+    def test_renderer_removes_only_amountless_duplicate_account_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workbook_path = root / "duplicates.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Account", "Description", "Debit", "Credit"])
+            sheet.append(["1600 0", "Amount-bearing occurrence", None, 283837.12])
+            sheet.append(["1600 0", "Explanatory repeat", None, None])
+            sheet.append(["1400 0", "First real occurrence", 1250956.78, None])
+            sheet.append(["1400 0", "Second real occurrence", 18573.98, None])
+            workbook.save(workbook_path)
+
+            capture = capture_workbook(
+                workbook_path,
+                root / "rendered",
+                rows_per_image=30,
+            )
+            captured_rows = {
+                row
+                for screenshot in capture.screenshots
+                for row in screenshot.populated_rows
+            }
+
+            self.assertIn(2, captured_rows)
+            self.assertNotIn(3, captured_rows)
+            self.assertIn(4, captured_rows)
+            self.assertIn(5, captured_rows)
+            self.assertEqual(
+                sum(item.estimated_records for item in capture.screenshots),
+                3,
+            )
+
+    def test_schema_columns_are_selected_once_for_every_screenshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workbook_path = root / "wide.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(
+                [
+                    "Hierarchy",
+                    "Account",
+                    "Description",
+                    "Current",
+                    "Prior",
+                    "Variance",
+                ]
+            )
+            for row in range(2, 64):
+                sheet.append(
+                    [
+                        "Section",
+                        f"A{row:04d}",
+                        f"Account {row}",
+                        float(row),
+                        float(row - 1),
+                        1.0,
+                    ]
+                )
+            workbook.save(workbook_path)
+
+            capture = capture_workbook(
+                workbook_path,
+                root / "rendered",
+                rows_per_image=30,
+            )
+            selected = select_capture_columns(
+                capture,
+                (2, 3, 4),
+                2,
+                root / "selected",
+            )
+
+            self.assertEqual(selected.populated_columns, (2, 3, 4))
+            self.assertIsNone(selected.header_context)
+            self.assertEqual(len(selected.screenshots), len(capture.screenshots))
+            self.assertTrue(
+                all(
+                    item.populated_columns == (2, 3, 4)
+                    for item in selected.screenshots
+                )
+            )
+            with (
+                Image.open(capture.screenshots[0].path) as full_image,
+                Image.open(selected.screenshots[0].path) as selected_image,
+            ):
+                self.assertLess(selected_image.width, full_image.width)
+
     def test_copilot_batch_size_is_hard_capped_at_30(self) -> None:
         screenshots = tuple(SimpleNamespace(path=Path(f"{index}.png")) for index in range(65))
         batches = chunk_screenshots(screenshots, 999)  # type: ignore[arg-type]
-        self.assertEqual([len(batch) for batch in batches], [29, 29, 7])
-        self.assertLessEqual(1 + max(len(batch) for batch in batches), 30)
+        self.assertEqual([len(batch) for batch in batches], [30, 30, 5])
+        self.assertLessEqual(max(len(batch) for batch in batches), 30)
 
     def test_copilot_batches_are_limited_by_estimated_record_volume(self) -> None:
         screenshots = tuple(
@@ -172,7 +270,7 @@ class BalanceRendererTests(unittest.TestCase):
         )
         self.assertEqual([len(batch) for batch in batches], [2, 2, 1])
 
-    def test_production_uses_ten_target_screenshots_per_request(self) -> None:
+    def test_production_uses_five_target_screenshots_per_request(self) -> None:
         settings = json.loads(
             (
                 SERVICE
@@ -181,33 +279,199 @@ class BalanceRendererTests(unittest.TestCase):
                 / "settings.json"
             ).read_text(encoding="utf-8")
         )
-        self.assertEqual(settings["batch_size"], 10)
+        self.assertEqual(settings["batch_size"], 5)
         self.assertEqual(settings["rows_per_image"], 30)
         self.assertEqual(settings["max_estimated_records_per_request"], 120)
 
     def test_batch_prompt_retains_the_extraction_instructions(self) -> None:
-        screenshot = SimpleNamespace(row_start=1, row_end=100)
+        screenshot = SimpleNamespace(
+            row_start=1,
+            row_end=100,
+            estimated_records=17,
+            candidate_account_numbers=("A100", "A200"),
+        )
         capture = SimpleNamespace(sheet_name="Balance")
         base = "EXTRACT THESE ACCOUNTS"
-        batch_prompt = _batch_prompt(base, capture, (screenshot,), 1, 2)  # type: ignore[arg-type]
-        self.assertTrue(batch_prompt.startswith(base))
-        self.assertIn("Excel rows 1-100", batch_prompt)
-
-        context_prompt = _batch_prompt(
+        schema = {
+            "account_fields": {
+                "account_number_column_position": 2,
+                "account_description_column_position": 3,
+            },
+            "saldo": {"source_column_positions": [4]},
+        }
+        batch_prompt = _batch_prompt(  # type: ignore[arg-type]
             base,
             capture,
-            (SimpleNamespace(row_start=101, row_end=200),),  # type: ignore[arg-type]
+            (screenshot,),
+            1,
             2,
-            2,
-            (screenshot,),  # type: ignore[arg-type]
+            schema,
+            (2, 3, 4),
         )
-        self.assertIn("HEADER/STRUCTURE CONTEXT ONLY", context_prompt)
-        self.assertIn("Do not extract or repeat any account from those context images", context_prompt)
-        self.assertIn("image 2=Excel rows 101-200", context_prompt)
-        self.assertNotIn("independent verification read", context_prompt)
+        self.assertTrue(batch_prompt.startswith(base))
+        self.assertIn("Excel rows 1-100", batch_prompt)
+        self.assertIn("mechanical candidate-row estimate: 17", batch_prompt)
+        self.assertIn("navigation and completeness aid", batch_prompt)
+        self.assertIn("never extract a title, total, subtotal", batch_prompt)
+        self.assertIn('"account_number_candidates":["A100","A200"]', batch_prompt)
+        self.assertIn('"source_column_positions":[4]', batch_prompt)
+        self.assertIn("only these original 1-based schema column positions", batch_prompt)
+        self.assertIn("candidate lists contain 2 amount-bearing account rows", batch_prompt)
+        self.assertIn("Never attach one candidate's description or saldo", batch_prompt)
+        self.assertNotIn("HEADER/STRUCTURE CONTEXT ONLY", batch_prompt)
+        self.assertNotIn("independent verification read", batch_prompt)
+
+    def test_schema_validation_selects_only_account_description_and_saldo_columns(
+        self,
+    ) -> None:
+        schema = {
+            "columns": [
+                {"position": 1, "role": "hierarchy_or_category"},
+                {"position": 2, "role": "account_number"},
+                {"position": 3, "role": "account_description"},
+                {"position": 4, "role": "current_or_closing_balance"},
+                {"position": 5, "role": "comparison_or_prior_period"},
+            ],
+            "account_fields": {
+                "account_number_column_position": 2,
+                "account_description_column_position": 3,
+            },
+            "saldo": {"source_column_positions": [4]},
+        }
+        schema["saldo"]["valid_account_balance_patterns"] = [  # type: ignore[index]
+            {
+                "source_column_positions": [4],
+                "visible_account_examples": ["A100"],
+            }
+        ]
+
+        parsed, selected, account_position = _extract_schema(schema, 5)
+
+        self.assertIs(parsed, schema)
+        self.assertEqual(selected, (2, 3, 4))
+        self.assertEqual(account_position, 2)
+
+    def test_schema_validation_requires_every_visible_column(self) -> None:
+        schema = {
+            "columns": [{"position": 1}, {"position": 3}],
+            "account_fields": {
+                "account_number_column_position": 1,
+                "account_description_column_position": 2,
+            },
+            "saldo": {
+                "source_column_positions": [3],
+                "valid_account_balance_patterns": [
+                    {
+                        "source_column_positions": [3],
+                        "visible_account_examples": ["100"],
+                    }
+                ],
+            },
+        }
+        with self.assertRaisesRegex(RuntimeError, "every visible column"):
+            _extract_schema(schema, 3)
+
+    def test_schema_prompt_adds_candidate_occupancy_without_amounts(self) -> None:
+        screenshot = SimpleNamespace(
+            candidate_account_numbers=("43 0", "27 0"),
+            candidate_numeric_positions=(
+                ("43 0", (4, 5)),
+                ("27 0", (3, 5)),
+            ),
+        )
+
+        prompt = _schema_prompt("ANALYZE THE HEADER", screenshot)  # type: ignore[arg-type]
+
+        self.assertIn('"account_number": "43 0"', prompt)
+        self.assertIn('"nonempty_numeric_column_positions": [4, 5]', prompt)
+        self.assertIn("positions only, never amounts", prompt)
+        self.assertNotIn("1649349.79", prompt)
+
+    def test_schema_validation_rejects_horizontal_shift_on_first_account(self) -> None:
+        schema = {
+            "columns": [
+                {"position": 1},
+                {"position": 2},
+                {"position": 3},
+                {"position": 4},
+                {"position": 5},
+            ],
+            "account_fields": {
+                "account_number_column_position": 1,
+                "account_description_column_position": 2,
+            },
+            "saldo": {
+                "source_column_positions": [3],
+                "valid_account_balance_patterns": [
+                    {
+                        "source_column_positions": [3],
+                        "visible_account_examples": ["43 0"],
+                    }
+                ],
+                "worked_visible_examples": [
+                    {"account_number": "43 0", "resulting_saldo": 1649349.79}
+                ],
+            },
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "horizontally misaligned"):
+            _extract_schema(schema, 5, (("43 0", (4, 5)),))
 
 
 class BalanceResponseTests(unittest.TestCase):
+    def test_reconciles_only_unique_one_character_account_ocr_errors(self) -> None:
+        records = [
+            {
+                "account_number": "Z13641100",
+                "account_description": "Account",
+                "saldo": 1.0,
+            },
+            {
+                "account_number": "2000740011",
+                "account_description": "Account",
+                "saldo": 2.0,
+            },
+            {
+                "account_number": "H35150010",
+                "account_description": "Account",
+                "saldo": 3.0,
+            },
+        ]
+
+        reconciled, corrections = _reconcile_account_numbers(
+            records,
+            ("Z136411000", "200074001", "H35150010"),
+        )
+
+        self.assertEqual(
+            [item["account_number"] for item in reconciled],
+            ["Z136411000", "200074001", "H35150010"],
+        )
+        self.assertEqual(
+            corrections,
+            [
+                {"from": "Z13641100", "to": "Z136411000"},
+                {"from": "2000740011", "to": "200074001"},
+            ],
+        )
+
+    def test_does_not_reconcile_ambiguous_account_ocr_errors(self) -> None:
+        records = [
+            {
+                "account_number": "1002",
+                "account_description": "Account",
+                "saldo": 1.0,
+            }
+        ]
+
+        reconciled, corrections = _reconcile_account_numbers(
+            records,
+            ("1000", "1001"),
+        )
+
+        self.assertEqual(reconciled[0]["account_number"], "1002")
+        self.assertEqual(corrections, [])
+
     def test_runtime_accepts_json_arrays_and_prefers_latest_structured_answer(self) -> None:
         value = _parse_first_json_value(
             'Result follows: [{"account_number":"001","account_description":"Cash","saldo":1.5}] done'
@@ -265,6 +529,22 @@ class BalanceResponseTests(unittest.TestCase):
         self.assertIn("Treat the first visible row of every TARGET image", prompt)
         self.assertIn("silent completeness pass over every TARGET image", prompt)
         self.assertNotIn("Bilancio di verifica", prompt)
+
+    def test_schema_prompt_explains_later_requests_and_demands_evidence(self) -> None:
+        prompt = (
+            SERVICE
+            / "balance_cleaner"
+            / "config"
+            / "prompts"
+            / "balance_schema_v1.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("injected into later extraction requests", prompt)
+        self.assertIn("Enumerate ALL visible columns", prompt)
+        self.assertIn("visible_examples", prompt)
+        self.assertIn("worked_visible_examples", prompt)
+        self.assertIn("justification", prompt)
+        self.assertIn("first readable row", prompt)
+        self.assertIn("valid_account_balance_patterns", prompt)
 
 
 class BalanceDispatchTests(unittest.TestCase):

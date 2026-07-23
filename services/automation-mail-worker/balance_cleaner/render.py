@@ -30,6 +30,8 @@ class Screenshot:
     last_column: int
     populated_columns: tuple[int, ...]
     estimated_records: int
+    candidate_account_numbers: tuple[str, ...]
+    candidate_numeric_positions: tuple[tuple[str, tuple[int, ...]], ...]
 
 
 @dataclass(frozen=True)
@@ -169,6 +171,13 @@ def capture_workbook(
             target_rows,
             frozen_columns,
         )
+        target_rows = _remove_amountless_duplicate_account_rows(
+            selected,
+            values_sheet,
+            target_rows,
+            frozen_columns,
+            account_column,
+        )
         widths = _column_widths(
             selected,
             values_sheet,
@@ -204,11 +213,23 @@ def capture_workbook(
                 last_column=frozen_columns[-1],
                 populated_columns=frozen_columns,
                 estimated_records=0,
+                candidate_account_numbers=(),
+                candidate_numeric_positions=(),
             )
 
         image_number = 1
         for group_start in range(0, len(target_rows), rows_per_image):
             rows = target_rows[group_start : group_start + rows_per_image]
+            candidate_evidence = _candidate_account_evidence(
+                selected,
+                values_sheet,
+                rows,
+                frozen_columns,
+                account_column,
+            )
+            candidate_account_numbers = tuple(
+                account_number for account_number, _positions in candidate_evidence
+            )
             image_path = screenshots_dir / f"{image_number:04d}.png"
             _render_rows(
                 selected,
@@ -227,13 +248,9 @@ def capture_workbook(
                     first_column=frozen_columns[0],
                     last_column=frozen_columns[-1],
                     populated_columns=frozen_columns,
-                    estimated_records=_estimate_record_count(
-                        selected,
-                        values_sheet,
-                        rows,
-                        frozen_columns,
-                        account_column,
-                    ),
+                    estimated_records=len(candidate_account_numbers),
+                    candidate_account_numbers=candidate_account_numbers,
+                    candidate_numeric_positions=candidate_evidence,
                 )
             )
             image_number += 1
@@ -250,6 +267,109 @@ def capture_workbook(
             populated_columns=frozen_columns,
             header_context=header_context,
             screenshots=tuple(screenshots),
+        )
+    finally:
+        workbook.close()
+        values_workbook.close()
+
+
+def select_capture_columns(
+    capture: WorkbookCapture,
+    visible_positions: tuple[int, ...],
+    account_number_position: int,
+    output_dir: Path,
+    *,
+    image_max_width: int = 12000,
+) -> WorkbookCapture:
+    """Re-render every target screenshot with one fixed schema-selected view."""
+    if not visible_positions:
+        raise ValueError("At least one visible column position is required")
+    if tuple(sorted(set(visible_positions))) != visible_positions:
+        raise ValueError("Visible column positions must be unique and sorted")
+    if account_number_position not in visible_positions:
+        raise ValueError("The account-number column must remain visible")
+    column_count = len(capture.populated_columns)
+    if any(position < 1 or position > column_count for position in visible_positions):
+        raise ValueError(
+            f"Visible column positions must be between 1 and {column_count}"
+        )
+
+    selected_columns = tuple(
+        capture.populated_columns[position - 1]
+        for position in visible_positions
+    )
+    account_column = capture.populated_columns[account_number_position - 1]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        workbook = load_workbook(
+            capture.workbook_path,
+            data_only=False,
+            read_only=False,
+        )
+        values_workbook = load_workbook(
+            capture.workbook_path,
+            data_only=True,
+            read_only=False,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not reopen Excel workbook {capture.source_path.name}: {exc}"
+        ) from exc
+
+    try:
+        sheet = workbook[capture.sheet_name]
+        values_sheet = values_workbook[capture.sheet_name]
+        widths = _column_widths(
+            sheet,
+            values_sheet,
+            selected_columns,
+            image_max_width,
+        )
+        selected_screenshots: list[Screenshot] = []
+        for source_screenshot in capture.screenshots:
+            output_path = output_dir / source_screenshot.path.name
+            _render_rows(
+                sheet,
+                values_sheet,
+                source_screenshot.populated_rows,
+                selected_columns,
+                widths,
+                output_path,
+            )
+            candidate_evidence = _candidate_account_evidence(
+                sheet,
+                values_sheet,
+                source_screenshot.populated_rows,
+                selected_columns,
+                account_column,
+            )
+            candidate_account_numbers = tuple(
+                account_number for account_number, _positions in candidate_evidence
+            )
+            selected_screenshots.append(
+                Screenshot(
+                    path=output_path,
+                    row_start=source_screenshot.row_start,
+                    row_end=source_screenshot.row_end,
+                    populated_rows=source_screenshot.populated_rows,
+                    first_column=selected_columns[0],
+                    last_column=selected_columns[-1],
+                    populated_columns=selected_columns,
+                    estimated_records=len(candidate_account_numbers),
+                    candidate_account_numbers=candidate_account_numbers,
+                    candidate_numeric_positions=candidate_evidence,
+                )
+            )
+        return WorkbookCapture(
+            source_path=capture.source_path,
+            workbook_path=capture.workbook_path,
+            sheet_name=capture.sheet_name,
+            last_populated_row=capture.last_populated_row,
+            first_populated_column=selected_columns[0],
+            last_populated_column=selected_columns[-1],
+            populated_columns=selected_columns,
+            header_context=None,
+            screenshots=tuple(selected_screenshots),
         )
     finally:
         workbook.close()
@@ -411,7 +531,44 @@ def _estimate_record_count(
     columns: tuple[int, ...],
     account_column: int,
 ) -> int:
-    count = 0
+    return len(
+        _candidate_account_numbers(
+            sheet,
+            values_sheet,
+            rows,
+            columns,
+            account_column,
+        )
+    )
+
+
+def _candidate_account_numbers(
+    sheet: Worksheet,
+    values_sheet: Worksheet,
+    rows: tuple[int, ...],
+    columns: tuple[int, ...],
+    account_column: int,
+) -> tuple[str, ...]:
+    return tuple(
+        account_number
+        for account_number, _positions in _candidate_account_evidence(
+            sheet,
+            values_sheet,
+            rows,
+            columns,
+            account_column,
+        )
+    )
+
+
+def _candidate_account_evidence(
+    sheet: Worksheet,
+    values_sheet: Worksheet,
+    rows: tuple[int, ...],
+    columns: tuple[int, ...],
+    account_column: int,
+) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    candidates: list[tuple[str, tuple[int, ...]]] = []
     for row in rows:
         account = _effective_value(
             sheet,
@@ -421,13 +578,53 @@ def _estimate_record_count(
         )
         if not _has_value(account) or not _looks_account_identifier(account):
             continue
-        if any(
+        numeric_positions = tuple(
+            position
+            for position, column in enumerate(columns, start=1)
+            if column != account_column
+            and _looks_numeric(_effective_value(sheet, values_sheet, row, column))
+        )
+        if numeric_positions:
+            candidates.append((_identifier_key(account), numeric_positions))
+    return tuple(candidates)
+
+
+def _remove_amountless_duplicate_account_rows(
+    sheet: Worksheet,
+    values_sheet: Worksheet,
+    rows: tuple[int, ...],
+    columns: tuple[int, ...],
+    account_column: int,
+) -> tuple[int, ...]:
+    """Drop only blank explanatory repeats of an amount-bearing account row."""
+
+    def account_key(row: int) -> str | None:
+        value = _effective_value(sheet, values_sheet, row, account_column)
+        if not _has_value(value) or not _looks_account_identifier(value):
+            return None
+        return _identifier_key(value)
+
+    def has_numeric_amount(row: int) -> bool:
+        return any(
             _looks_numeric(_effective_value(sheet, values_sheet, row, column))
             for column in columns
             if column != account_column
-        ):
-            count += 1
-    return count
+        )
+
+    amount_bearing_accounts = {
+        key
+        for row in rows
+        if (key := account_key(row)) is not None and has_numeric_amount(row)
+    }
+    return tuple(
+        row
+        for row in rows
+        if not (
+            (key := account_key(row)) in amount_bearing_accounts
+            and key is not None
+            and not has_numeric_amount(row)
+        )
+    )
 
 
 def _header_rows(
@@ -499,7 +696,7 @@ def _column_widths(
             displayed = _display_value(cell, cached)
             longest = max(longest, *(len(line) for line in displayed.splitlines() or [""]))
         characters = max(8.0, configured, min(float(longest), 48.0))
-        widths[column] = min(410, max(68, int(characters * 8 + 14)))
+        widths[column] = min(410, max(68, int(characters * 9 + 16)))
 
     available = image_max_width - 24
     total = sum(widths.values())
@@ -523,7 +720,7 @@ def _font(bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     )
     for name in names:
         try:
-            return ImageFont.truetype(name, 16)
+            return ImageFont.truetype(name, 18)
         except OSError:
             continue
     return ImageFont.load_default()

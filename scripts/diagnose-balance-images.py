@@ -49,6 +49,9 @@ def main() -> int:
     settings["rows_per_image"] = args.rows_per_image
     settings["batch_size"] = args.group_size
     prompt_path = SERVICE / "balance_cleaner" / str(settings["prompt_file"])
+    schema_prompt_path = (
+        SERVICE / "balance_cleaner" / str(settings["schema_prompt_file"])
+    )
     workbook = args.workbook.resolve()
     if not workbook.is_file():
         raise FileNotFoundError(workbook)
@@ -64,6 +67,7 @@ def main() -> int:
         },
         settings,
         prompt_path.read_text(encoding="utf-8-sig"),
+        schema_prompt_path.read_text(encoding="utf-8-sig"),
     )
     print(f"DIAGNOSTIC_OUTPUT={result}", flush=True)
     return 0

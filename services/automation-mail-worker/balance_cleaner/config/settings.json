@@ -9,9 +9,10 @@
   "timeout_seconds": 1200,
   "cleanup_rendered_images": true,
   "rows_per_image": 30,
-  "batch_size": 10,
+  "batch_size": 5,
   "max_estimated_records_per_request": 120,
   "image_max_width": 12000,
   "libreoffice_bin": "libreoffice",
-  "prompt_file": "config/prompts/balance_extract_v1.md"
+  "prompt_file": "config/prompts/balance_extract_v1.md",
+  "schema_prompt_file": "config/prompts/balance_schema_v1.md"
 }
