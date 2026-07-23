@@ -50,6 +50,7 @@ class Settings:
     subject_prefix: str
     fs_subject_prefix: str
     effectif_subject_prefix: str
+    balance_subject_prefix: str
     fs_default_year: int
     authorized_job_senders: tuple[str, ...]
     authorized_job_sender_domains: tuple[str, ...]
@@ -73,6 +74,7 @@ class Settings:
     queue_default_fs_seconds: int
     queue_default_effectif_seconds: int
     queue_default_signature_seconds: int
+    queue_default_balance_seconds: int
     send_retry_notifications: bool
     max_outbound_emails_per_hour: int
     max_outbound_emails_per_day: int
@@ -80,6 +82,7 @@ class Settings:
     extraction_timeout_seconds: int
     fs_review_timeout_seconds: int
     effectif_timeout_seconds: int
+    balance_timeout_seconds: int
     max_result_attachment_bytes: int
     imap_timeout_seconds: int
     smtp_timeout_seconds: int
@@ -93,21 +96,25 @@ def load_settings() -> Settings:
     load_dotenv(dotenv_path=Path(env_file) if env_file else project_dir / ".env", encoding="utf-8-sig")
 
     data_dir = Path(os.getenv("BOT_DATA_DIR", str(project_dir))).expanduser()
-    authorized_job_senders = tuple(
+    gmail_address = _get_required_env("GMAIL_ADDRESS")
+    configured_job_senders = tuple(
         value.lower() for value in _get_csv_env("AUTHORIZED_JOB_SENDERS", ())
     )
     authorized_job_sender_domains = tuple(
         value.lower().lstrip("@")
         for value in _get_csv_env("AUTHORIZED_JOB_SENDER_DOMAINS", ())
     )
-    if not authorized_job_senders and not authorized_job_sender_domains:
+    if not configured_job_senders and not authorized_job_sender_domains:
         raise RuntimeError(
             "Configure AUTHORIZED_JOB_SENDERS or AUTHORIZED_JOB_SENDER_DOMAINS; "
             "the mail worker fails closed without a sender allowlist"
         )
+    authorized_job_senders = tuple(
+        dict.fromkeys((*configured_job_senders, gmail_address.lower()))
+    )
 
     return Settings(
-        gmail_address=_get_required_env("GMAIL_ADDRESS"),
+        gmail_address=gmail_address,
         gmail_app_password=_get_required_env("GMAIL_APP_PASSWORD").replace(" ", ""),
         imap_host=os.getenv("IMAP_HOST", "imap.gmail.com").strip(),
         imap_port=_get_int_env("IMAP_PORT", 993),
@@ -120,6 +127,7 @@ def load_settings() -> Settings:
         subject_prefix=os.getenv("SUBJECT_PREFIX", "[optimda-extract-dates]"),
         fs_subject_prefix=os.getenv("FS_SUBJECT_PREFIX", "[fs-review]"),
         effectif_subject_prefix=os.getenv("EFFECTIF_SUBJECT_PREFIX", "[optimda-effectif]"),
+        balance_subject_prefix=os.getenv("BALANCE_SUBJECT_PREFIX", "[balance-cleaner]"),
         fs_default_year=_get_int_env("FS_DEFAULT_YEAR", 2025),
         authorized_job_senders=authorized_job_senders,
         authorized_job_sender_domains=authorized_job_sender_domains,
@@ -147,6 +155,9 @@ def load_settings() -> Settings:
         queue_default_signature_seconds=_get_int_env(
             "QUEUE_DEFAULT_SIGNATURE_SECONDS", 5 * 60
         ),
+        queue_default_balance_seconds=_get_int_env(
+            "QUEUE_DEFAULT_BALANCE_SECONDS", 15 * 60
+        ),
         send_retry_notifications=_get_bool_env("SEND_RETRY_NOTIFICATIONS", True),
         max_outbound_emails_per_hour=_get_int_env("MAX_OUTBOUND_EMAILS_PER_HOUR", 40),
         max_outbound_emails_per_day=_get_int_env("MAX_OUTBOUND_EMAILS_PER_DAY", 200),
@@ -154,6 +165,7 @@ def load_settings() -> Settings:
         extraction_timeout_seconds=_get_int_env("EXTRACTION_TIMEOUT_SECONDS", 300),
         fs_review_timeout_seconds=_get_int_env("FS_REVIEW_TIMEOUT_SECONDS", 3 * 60 * 60),
         effectif_timeout_seconds=_get_int_env("EFFECTIF_TIMEOUT_SECONDS", 6 * 60 * 60),
+        balance_timeout_seconds=_get_int_env("BALANCE_TIMEOUT_SECONDS", 6 * 60 * 60),
         max_result_attachment_bytes=_get_int_env("MAX_RESULT_ATTACHMENT_BYTES", 20 * 1024 * 1024),
         imap_timeout_seconds=_get_int_env("IMAP_TIMEOUT_SECONDS", 30),
         smtp_timeout_seconds=_get_int_env("SMTP_TIMEOUT_SECONDS", 60),

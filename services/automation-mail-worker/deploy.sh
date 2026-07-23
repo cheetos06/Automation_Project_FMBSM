@@ -49,7 +49,11 @@ SERVER_USER="$2"
 SERVER_HOST="$3"
 
 sudo mkdir -p "$REMOTE_DIR"
-sudo chown "$SERVER_USER:$SERVER_USER" "$REMOTE_DIR"
+# Prior recovery/deployment operations can leave deployed source files owned by
+# root. The services themselves run as SERVER_USER and all persistent state is
+# already scoped beneath REMOTE_DIR, so restore the expected ownership before the
+# in-place source refresh.
+sudo chown -R "$SERVER_USER:$SERVER_USER" "$REMOTE_DIR"
 old_upload_key=""
 old_admin_key=""
 if [[ -f "$REMOTE_DIR/.env" ]]; then
@@ -98,6 +102,8 @@ ensure_env FS_SUBJECT_PREFIX "[fs-review]"
 ensure_env FS_REVIEW_TIMEOUT_SECONDS "10800"
 ensure_env EFFECTIF_SUBJECT_PREFIX "[optimda-effectif]"
 ensure_env EFFECTIF_TIMEOUT_SECONDS "21600"
+ensure_env BALANCE_SUBJECT_PREFIX "[balance-cleaner]"
+ensure_env BALANCE_TIMEOUT_SECONDS "21600"
 ensure_env MAX_RESULT_ATTACHMENT_BYTES "20971520"
 ensure_env MAX_QUEUED_JOBS "50"
 ensure_env MIN_FREE_DISK_BYTES "2147483648"
@@ -105,12 +111,14 @@ ensure_env QUEUE_RETRY_DELAY_SECONDS "30"
 ensure_env QUEUE_DEFAULT_FS_SECONDS "900"
 ensure_env QUEUE_DEFAULT_EFFECTIF_SECONDS "900"
 ensure_env QUEUE_DEFAULT_SIGNATURE_SECONDS "300"
+ensure_env QUEUE_DEFAULT_BALANCE_SECONDS "900"
 ensure_env SEND_RETRY_NOTIFICATIONS "true"
 chmod 600 "$REMOTE_DIR/.env"
 
 sudo apt-get update
 sudo apt-get install -y \
-  ca-certificates libgdiplus libglib2.0-0 libgomp1 libicu74 libssl-dev \
+  ca-certificates fonts-dejavu-core libgdiplus libglib2.0-0 libgomp1 libicu74 libssl-dev \
+  libreoffice-calc \
   openssl p7zip-full python3-pip python3-venv unzip wget
 
 if ! sudo swapon --show=NAME --noheadings | grep -q .; then
@@ -166,7 +174,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip wheel
 python -m pip install -r requirements.txt
-python -m compileall -q fmbsm_email_bot copilot_service copilot_runtime fs_review effectif_extract
+python -m compileall -q fmbsm_email_bot copilot_service copilot_runtime fs_review effectif_extract balance_cleaner
 deactivate
 
 sudo cp systemd/fmbsm-token-api.service /etc/systemd/system/fmbsm-token-api.service

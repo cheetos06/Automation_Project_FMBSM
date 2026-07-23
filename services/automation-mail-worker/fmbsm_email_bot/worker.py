@@ -18,6 +18,7 @@ from pathlib import Path
 
 from copilot_service.job_status import JobStatusStore
 
+from .balance_job import run_balance_job
 from .config import Settings, ensure_directories, load_settings
 from .effectif_job import run_effectif_job
 from .files import safe_filename, unique_path
@@ -370,6 +371,7 @@ def _queue_defaults(settings: Settings) -> dict[str, int]:
         "fs_review": settings.queue_default_fs_seconds,
         "effectif_payroll": settings.queue_default_effectif_seconds,
         "signature_dates": settings.queue_default_signature_seconds,
+        "balance_cleaner": settings.queue_default_balance_seconds,
     }
 
 
@@ -490,6 +492,24 @@ def process_email(
                     status_store=status_store,
                 )
                 processed_label = f"{len(pdf_paths)} PDF effectif/payroll extraction"
+            elif job_kind == "balance_cleaner":
+                workbook_paths = _prepare_balance_inputs(
+                    inbound, attachments_dir, extracted_dir, job_dir, settings
+                )
+                logger.info(
+                    "Job %s collected %s Excel balance workbook(s)",
+                    job_id,
+                    len(workbook_paths),
+                )
+                outputs = run_balance_job(
+                    workbook_paths=workbook_paths,
+                    output_dir=output_dir,
+                    job_id=job_id,
+                    timeout_seconds=settings.balance_timeout_seconds,
+                    project_dir=settings.project_dir,
+                    status_store=status_store,
+                )
+                processed_label = f"{len(workbook_paths)} cleaned trial balance workbook(s)"
             else:
                 pdf_paths = _prepare_pdf_inputs(
                     inbound, attachments_dir, extracted_dir, job_dir, settings
@@ -691,6 +711,27 @@ def _prepare_pdf_inputs(
     return paths
 
 
+def _prepare_balance_inputs(
+    inbound: InboundEmail,
+    attachments_dir: Path,
+    extracted_dir: Path,
+    job_dir: Path,
+    settings: Settings,
+) -> list[Path]:
+    manifest = _read_input_manifest(job_dir)
+    paths = [Path(str(value)) for value in manifest.get("workbook_paths", [])]
+    if manifest.get("kind") == "balance_workbooks" and paths and all(
+        path.is_file() for path in paths
+    ):
+        return paths
+    paths = save_balance_attachments(inbound, attachments_dir, extracted_dir, settings)
+    _write_input_manifest(
+        job_dir,
+        {"kind": "balance_workbooks", "workbook_paths": [str(path) for path in paths]},
+    )
+    return paths
+
+
 def _read_input_manifest(job_dir: Path) -> dict[str, object]:
     path = job_dir / "input_manifest.json"
     try:
@@ -825,6 +866,79 @@ def save_fs_attachments(
     return accepted
 
 
+def save_balance_attachments(
+    inbound: InboundEmail,
+    attachments_dir: Path,
+    extracted_dir: Path,
+    settings: Settings,
+) -> list[Path]:
+    accepted: list[Path] = []
+    allowed = {".xlsx", ".xlsm", ".xls", ".xlsb"}
+    excel_content_types = {
+        "application/vnd.ms-excel": ".xls",
+        "application/vnd.ms-excel.sheet.binary.macroenabled.12": ".xlsb",
+        "application/vnd.ms-excel.sheet.macroenabled.12": ".xlsm",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    }
+    attachment_index = 0
+    for part in inbound.message.walk():
+        if part.is_multipart():
+            continue
+        filename = part.get_filename()
+        content_type = part.get_content_type()
+        if not filename and content_type not in {
+            *excel_content_types,
+            "application/zip",
+            "application/x-zip-compressed",
+            "application/x-7z-compressed",
+        }:
+            continue
+        attachment_index += 1
+        if filename:
+            suffix = Path(filename).suffix.lower()
+        else:
+            suffix = excel_content_types.get(content_type, ".7z" if content_type == "application/x-7z-compressed" else ".zip")
+            filename = f"attachment_{attachment_index}{suffix}"
+        if suffix not in {*allowed, ".zip", ".7z"}:
+            continue
+        payload = get_payload_bytes(part)
+        if not payload:
+            logger.warning("Skipping empty balance attachment %s on UID %s", filename, inbound.uid)
+            continue
+        if len(payload) > settings.max_attachment_bytes:
+            raise RuntimeError(f"Attachment {filename} exceeds size limit")
+        attachment_path = unique_path(
+            attachments_dir,
+            safe_filename(filename, f"attachment_{attachment_index}{suffix}"),
+        )
+        attachment_path.write_bytes(payload)
+        logger.info("Saved balance attachment %s", attachment_path)
+        if suffix in allowed:
+            accepted.append(attachment_path)
+            continue
+        archive_destination = extracted_dir / attachment_path.stem
+        extracted = safe_extract_files(
+            attachment_path,
+            archive_destination,
+            allowed_suffixes=allowed,
+            max_extracted_bytes=settings.max_zip_extracted_bytes,
+            max_files=settings.max_zip_files,
+            max_depth=settings.max_archive_depth,
+        )
+        logger.info(
+            "Extracted %s Excel balance input(s) from %s",
+            len(extracted),
+            attachment_path.name,
+        )
+        accepted.extend(extracted)
+    if not accepted:
+        raise RuntimeError(
+            "No Excel balance found. Attach an .xlsx, .xlsm, .xls, or .xlsb file "
+            "(directly or inside a .zip/.7z archive)."
+        )
+    return accepted
+
+
 def _fallback_attachment_name(index: int, content_type: str) -> str:
     if content_type == "application/pdf":
         return f"attachment_{index}.pdf"
@@ -926,6 +1040,7 @@ def _should_mark_bot_message_seen(settings: Settings, inbound: InboundEmail) -> 
             settings.subject_prefix,
             settings.fs_subject_prefix,
             settings.effectif_subject_prefix,
+            settings.balance_subject_prefix,
         )
     )
 
@@ -937,6 +1052,8 @@ def _job_kind(settings: Settings, subject: str) -> str | None:
         return "fs_review"
     if subject.startswith(settings.effectif_subject_prefix):
         return "effectif_payroll"
+    if subject.startswith(settings.balance_subject_prefix):
+        return "balance_cleaner"
     return None
 
 
@@ -960,6 +1077,7 @@ def _ack_body(job_kind: str, job_id: str, queue: dict[str, int]) -> str:
         "fs_review": "financial-statement review",
         "effectif_payroll": "effectif/payroll evidence extraction",
         "signature_dates": "PDF signature/date extraction",
+        "balance_cleaner": "trial balance cleaning",
     }
     label = labels.get(job_kind, job_kind.replace("_", " "))
     if queue["position"] == 1:
@@ -985,6 +1103,7 @@ def _start_body(job_kind: str, job_id: str, expected_seconds: int) -> str:
         "fs_review": "financial-statement review",
         "effectif_payroll": "effectif/payroll evidence extraction",
         "signature_dates": "PDF signature/date extraction",
+        "balance_cleaner": "trial balance cleaning",
     }
     label = labels.get(job_kind, job_kind.replace("_", " "))
     return (
